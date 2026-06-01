@@ -43,7 +43,7 @@ envguard
 Scan another directory:
 
 ```bash
-envguard --path /path/to/project
+envguard /path/to/project
 ```
 
 Emit machine-readable JSON:
@@ -55,7 +55,7 @@ envguard --json
 Emit GitHub Actions annotations in CI logs:
 
 ```bash
-envguard --github-annotations
+envguard ci
 ```
 
 Use a custom dotenv example file:
@@ -89,7 +89,7 @@ envguard --fix
 
 ```bash
 export SUPABASE_ACCESS_TOKEN="sbp_..."
-envguard --supabase-project your-project-ref
+envguard supabase your-project-ref
 ```
 
 When Supabase secrets are included:
@@ -116,6 +116,10 @@ Comments and blank lines are ignored. Invalid variable names are skipped.
 ## Project Configuration
 
 You can store team defaults in `pyproject.toml` so developers and CI use the same scan settings without wrapper scripts:
+
+```bash
+envguard init --dotenv config/example.env --exclude "fixtures/**"
+```
 
 ```toml
 [tool.envguard]
@@ -152,8 +156,13 @@ usage: envguard [-h] [--path PATH] [--json] [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--debug] [--exclude PATTERN]
                 [--allow-unused] [--allow-missing]
+                [path|ci|supabase|init] [...]
 
 options:
+  path                  Optional project path, e.g. envguard apps/web.
+  ci [path]             Shortcut for GitHub Actions annotations.
+  supabase ID [path]    Shortcut for Supabase secret comparison.
+  init [path]           Write or update [tool.envguard] in pyproject.toml.
   -h, --help            Show help and exit.
   --path PATH           Project path to scan. Defaults to the current directory.
   --json                Print a JSON report.

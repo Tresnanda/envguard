@@ -178,3 +178,34 @@ def test_allow_flags_control_blocking_issue_detection() -> None:
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=False) is True
     assert envguard.has_blocking_issues(result, allow_unused=False, allow_missing=True) is True
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
+
+
+def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
+    positional = envguard.parse_cli_args(["apps/web"])
+    assert positional.path == "apps/web"
+
+    ci = envguard.parse_cli_args(["ci", "apps/web"])
+    assert ci.path == "apps/web"
+    assert ci.github_annotations is True
+
+    supabase = envguard.parse_cli_args(["supabase", "abcd1234"])
+    assert supabase.supabase_project == "abcd1234"
+
+
+def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:
+    envguard.write_project_config(
+        tmp_path,
+        dotenv="config/example.env",
+        exclude=["fixtures/**"],
+        supabase_project="abcd1234",
+    )
+
+    assert (tmp_path / "pyproject.toml").read_text(encoding="utf-8") == "\n".join(
+        [
+            "[tool.envguard]",
+            'dotenv = "config/example.env"',
+            'exclude = ["fixtures/**"]',
+            'supabase_project = "abcd1234"',
+            "",
+        ]
+    )

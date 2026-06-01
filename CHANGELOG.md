@@ -2,6 +2,13 @@
 
 All notable changes to envguard are documented here.
 
+## Unreleased
+
+- Added positional project paths, so `envguard apps/web` works as a shortcut for `--path`.
+- Added `envguard ci` as a shortcut for GitHub Actions annotation output.
+- Added `envguard supabase <project-ref>` as a shortcut for Supabase secret comparison.
+- Added `envguard init` to create or update `[tool.envguard]` defaults in `pyproject.toml`.
+
 ## 1.0.0 - 2026-06-01
 
 - Added environment-variable reference scanning for Python, JavaScript, Deno, shell, generic `env()`, and Windows-style patterns.

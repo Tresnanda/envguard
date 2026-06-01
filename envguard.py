@@ -324,6 +324,48 @@ def _resolve_config_path(value: str, scan_path: Path) -> Path:
     return project_root / path
 
 
+def _format_project_config(
+    dotenv: Optional[str],
+    exclude: Optional[List[str]],
+    supabase_project: Optional[str],
+) -> str:
+    """Format a minimal [tool.envguard] TOML block."""
+    lines = ["[tool.envguard]"]
+    if dotenv:
+        lines.append(f'dotenv = "{dotenv}"')
+    if exclude:
+        quoted = ", ".join(f'"{pattern}"' for pattern in exclude)
+        lines.append(f"exclude = [{quoted}]")
+    if supabase_project:
+        lines.append(f'supabase_project = "{supabase_project}"')
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_project_config(
+    project_path: Path,
+    dotenv: Optional[str] = None,
+    exclude: Optional[List[str]] = None,
+    supabase_project: Optional[str] = None,
+) -> Path:
+    """Create or replace the [tool.envguard] block in pyproject.toml."""
+    pyproject_path = project_path / "pyproject.toml"
+    new_block = _format_project_config(dotenv, exclude, supabase_project)
+
+    if not pyproject_path.exists():
+        pyproject_path.write_text(new_block, encoding="utf-8")
+        return pyproject_path
+
+    existing = pyproject_path.read_text(encoding="utf-8")
+    pattern = re.compile(r"(?ms)^\[tool\.envguard\]\n.*?(?=^\[|\Z)")
+    if pattern.search(existing):
+        updated = pattern.sub(new_block, existing).rstrip() + "\n"
+    else:
+        updated = existing.rstrip() + "\n\n" + new_block
+    pyproject_path.write_text(updated, encoding="utf-8")
+    return pyproject_path
+
+
 # ─── .env.example parsing ──────────────────────────────────────────────────
 
 
@@ -699,19 +741,25 @@ def interactive_fix(result: ScanResult, dotenv_path: Path):
 # ─── CLI Entry Point ───────────────────────────────────────────────────────
 
 
-def main(argv: Optional[List[str]] = None):
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="envguard — environment variable dead-key detector",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  envguard                          Scan current directory\n"
-            "  envguard --path /path/to/project   Scan a specific project\n"
+            "  envguard apps/web                  Scan a specific project\n"
+            "  envguard ci                        GitHub Actions annotations\n"
+            "  envguard supabase xyz              Compare with Supabase secrets\n"
+            "  envguard init                      Write [tool.envguard] defaults\n"
             "  envguard --json                    Machine-readable output\n"
-            "  envguard --github-annotations      GitHub Actions annotations\n"
             "  envguard --fix                     Interactive fix mode\n"
-            "  envguard --supabase-project xyz    Compare with Supabase secrets\n"
         ),
+    )
+    parser.add_argument(
+        "tokens",
+        nargs="*",
+        help="Optional project path or preset: ci, supabase <project-ref>, init",
     )
     parser.add_argument(
         "--path",
@@ -771,14 +819,65 @@ def main(argv: Optional[List[str]] = None):
         action="store_true",
         help="Do not fail when referenced variables are missing from configuration",
     )
+    return parser
 
+
+def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments and friendly command presets."""
+    parser = _build_parser()
     args = parser.parse_args(argv)
+    tokens = list(args.tokens)
+    args.command = None
+
+    if tokens:
+        first = tokens[0]
+        if first == "ci":
+            args.github_annotations = True
+            if len(tokens) > 2:
+                parser.error("ci accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
+        elif first == "supabase":
+            if len(tokens) < 2:
+                parser.error("supabase requires a project reference")
+            if len(tokens) > 3:
+                parser.error("supabase accepts: supabase <project-ref> [path]")
+            args.supabase_project = tokens[1]
+            if len(tokens) == 3:
+                args.path = tokens[2]
+        elif first == "init":
+            args.command = "init"
+            if len(tokens) > 2:
+                parser.error("init accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
+        else:
+            if len(tokens) > 1:
+                parser.error("expected one project path")
+            args.path = first
+
+    del args.tokens
+    return args
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_cli_args(argv)
 
     # Resolve paths
     scan_path = Path(args.path).resolve()
     if not scan_path.exists():
         print(f"Error: path does not exist: {scan_path}", file=sys.stderr)
         sys.exit(1)
+
+    if args.command == "init":
+        config_path = write_project_config(
+            scan_path,
+            dotenv=args.dotenv,
+            exclude=args.exclude,
+            supabase_project=args.supabase_project,
+        )
+        print(f"Wrote envguard config to {config_path}")
+        return
 
     config = load_project_config(scan_path)
 
