@@ -8,6 +8,7 @@ against .env.example (or a Supabase project's Edge Function secrets).
 from __future__ import annotations
 
 import argparse
+import getpass
 import html
 import json
 import os
@@ -389,6 +390,63 @@ def discover_dotenv_path(scan_path: Path, config: EnvguardConfig) -> Optional[Pa
     return None
 
 
+def parse_dotenv_value(path: Path, key: str) -> Optional[str]:
+    """Read a single dotenv value without exposing it in output."""
+    if not path.exists():
+        return None
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    pattern = re.compile(
+        rf"^(?:export\s+)?{re.escape(key)}\s*=\s*(.*)$",
+    )
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if "#" in value and not value.startswith(("'", '"')):
+            value = value.split("#", 1)[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value or None
+    return None
+
+
+def detect_supabase_access_token(
+    scan_path: Path,
+    dotenv_path: Optional[Path],
+    env: Mapping[str, str],
+) -> Optional[Tuple[str, str]]:
+    """Detect a Supabase access token from shell env, selected dotenv, or .env."""
+    env_token = env.get("SUPABASE_ACCESS_TOKEN", "").strip()
+    if env_token:
+        return env_token, "environment"
+
+    candidates: List[Path] = []
+    if dotenv_path is not None:
+        candidates.append(dotenv_path)
+    project_root = scan_path if scan_path.is_dir() else scan_path.parent
+    candidates.append(project_root / ".env")
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        token = parse_dotenv_value(candidate, "SUPABASE_ACCESS_TOKEN")
+        if token:
+            return token, str(candidate)
+    return None
+
+
 def detect_supabase_project_ref(
     scan_path: Path,
     env: Mapping[str, str],
@@ -456,6 +514,12 @@ def _ask_text(message: str, default: Optional[str] = None) -> str:
     return value or (default or "")
 
 
+def _ask_secret(message: str) -> str:
+    if Prompt is not None:
+        return Prompt.ask(message, password=True, default="")
+    return getpass.getpass(f"{message}: ").strip()
+
+
 def _ask_confirm(message: str, default: bool = False) -> bool:
     if Confirm is not None:
         return Confirm.ask(message, default=default)
@@ -470,6 +534,23 @@ def _format_command(args: List[str]) -> str:
     return "envguard " + " ".join(shlex.quote(item) for item in args)
 
 
+def _run_main_with_temporary_token(args: List[str], token: Optional[str]) -> None:
+    if not token:
+        main(args)
+        return
+
+    had_existing = "SUPABASE_ACCESS_TOKEN" in os.environ
+    previous = os.environ.get("SUPABASE_ACCESS_TOKEN")
+    os.environ["SUPABASE_ACCESS_TOKEN"] = token
+    try:
+        main(args)
+    finally:
+        if had_existing and previous is not None:
+            os.environ["SUPABASE_ACCESS_TOKEN"] = previous
+        else:
+            os.environ.pop("SUPABASE_ACCESS_TOKEN", None)
+
+
 def run_wizard() -> None:
     """Interactive command builder for envguard."""
     scan_path = Path(_ask_text("Project path", ".")).expanduser().resolve()
@@ -480,16 +561,27 @@ def run_wizard() -> None:
 
     dotenv_default = str(detected_dotenv) if detected_dotenv else ""
     dotenv = _ask_text("Dotenv template", dotenv_default) if dotenv_default else ""
-    use_supabase_default = bool(detected_supabase and os.environ.get("SUPABASE_ACCESS_TOKEN"))
+    selected_dotenv = Path(dotenv) if dotenv else detected_dotenv
+    token_info = detect_supabase_access_token(scan_path, selected_dotenv, os.environ)
+    supabase_token = token_info[0] if token_info else None
+    use_supabase_default = bool(detected_supabase and supabase_token)
     use_supabase = False
     supabase_project = detected_supabase or ""
     if edge_functions or detected_supabase:
         use_supabase = _ask_confirm("Compare Supabase Edge Function secrets", use_supabase_default)
         if use_supabase:
             supabase_project = _ask_text("Supabase project ref", supabase_project)
-            if not os.environ.get("SUPABASE_ACCESS_TOKEN"):
-                print("Tip: set SUPABASE_ACCESS_TOKEN to fetch remote Supabase secrets.")
-                use_supabase = False
+            if supabase_token:
+                print(f"Supabase access token detected in {token_info[1]}.")
+            else:
+                entered_token = _ask_secret(
+                    "Supabase access token (blank to skip remote secrets)"
+                ).strip()
+                if entered_token:
+                    supabase_token = entered_token
+                else:
+                    print("Tip: set SUPABASE_ACCESS_TOKEN to fetch remote Supabase secrets.")
+                    use_supabase = False
 
     args = build_wizard_args(
         {
@@ -503,7 +595,7 @@ def run_wizard() -> None:
     )
     print(f"\nGenerated command:\n  {_format_command(args)}\n")
     if _ask_confirm("Run it now", True):
-        main(args)
+        _run_main_with_temporary_token(args, supabase_token if use_supabase else None)
 
 
 # ─── .env.example parsing ──────────────────────────────────────────────────
@@ -1056,6 +1148,8 @@ def main(argv: Optional[List[str]] = None):
         os.environ,
         config,
     )
+    token_info = detect_supabase_access_token(scan_path, dotenv_path, os.environ)
+    supabase_access_token = token_info[0] if token_info else None
 
     # ── Scan codebase ──────────────────────────────────────────────────────
     ref_map = scan_directory(scan_path, exclude_patterns=exclude_patterns)
@@ -1080,12 +1174,12 @@ def main(argv: Optional[List[str]] = None):
     # ── Fetch Supabase secrets ─────────────────────────────────────────────
     supabase_keys: Optional[List[str]] = None
     if supabase_project:
-        access_token = os.environ.get("SUPABASE_ACCESS_TOKEN")
-        if not access_token:
+        if not supabase_access_token:
             if explicit_supabase_project:
                 print(
                     "Error: SUPABASE_ACCESS_TOKEN environment variable is required "
-                    "when using --supabase-project",
+                    "when using --supabase-project. You can also place it in .env "
+                    "or enter it through envguard wizard.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -1097,11 +1191,11 @@ def main(argv: Optional[List[str]] = None):
         elif explicit_supabase_project or should_auto_fetch_supabase(
             scan_path,
             supabase_project,
-            os.environ,
+            {"SUPABASE_ACCESS_TOKEN": supabase_access_token},
         ):
             if args.debug:
                 print(f"[debug] Fetching secrets for Supabase project: {supabase_project}")
-            supabase_keys = fetch_supabase_secrets(supabase_project, access_token)
+            supabase_keys = fetch_supabase_secrets(supabase_project, supabase_access_token)
         elif args.debug:
             print(
                 f"[debug] Supabase project detected ({supabase_project}), but no "

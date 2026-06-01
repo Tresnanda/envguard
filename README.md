@@ -112,7 +112,9 @@ When Supabase secrets are included:
 
 Create an access token at [app.supabase.com/account/tokens](https://app.supabase.com/account/tokens). Your project reference is the ID in a Supabase project URL such as `https://app.supabase.com/project/your-project-ref`.
 
-`envguard` also detects Supabase projects automatically from `[tool.envguard]`, `supabase/config.toml`, `SUPABASE_PROJECT_REF`, or `SUPABASE_PROJECT_ID`. Remote secrets are fetched only when a project ref is known, `SUPABASE_ACCESS_TOKEN` is set, and local Edge Functions are present, so ordinary scans stay predictable.
+`envguard` also detects Supabase projects automatically from `[tool.envguard]`, `supabase/config.toml`, `SUPABASE_PROJECT_REF`, or `SUPABASE_PROJECT_ID`. Remote secrets are fetched only when a project ref is known, a Supabase access token is available, and local Edge Functions are present, so ordinary scans stay predictable.
+
+The Supabase access token can come from `SUPABASE_ACCESS_TOKEN` in your shell, the selected dotenv file, the project `.env`, or a secure prompt in `envguard wizard`. Tokens entered in the wizard are used only for that run. They are not printed, written to `pyproject.toml`, or included in the generated command preview.
 
 ## `.env.example` Format
 

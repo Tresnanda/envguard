@@ -30,6 +30,23 @@ def test_parse_dotenv_example_reads_keys_and_ignores_comments(tmp_path: Path) ->
     ]
 
 
+def test_parse_dotenv_value_reads_secret_values_without_printing(tmp_path: Path) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "\n".join(
+            [
+                "# Local secrets",
+                "DATABASE_URL=postgres://localhost",
+                'export SUPABASE_ACCESS_TOKEN="sbp_local_token"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert envguard.parse_dotenv_value(dotenv, "SUPABASE_ACCESS_TOKEN") == "sbp_local_token"
+    assert envguard.parse_dotenv_value(dotenv, "MISSING") is None
+
+
 def test_detect_references_finds_common_environment_patterns(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text(
@@ -262,6 +279,75 @@ def test_should_auto_fetch_supabase_requires_ref_token_and_edge_functions(
         None,
         {"SUPABASE_ACCESS_TOKEN": "token"},
     )
+
+
+def test_detect_supabase_access_token_prefers_shell_then_dotenv(
+    tmp_path: Path,
+) -> None:
+    selected_dotenv = tmp_path / ".env.example"
+    selected_dotenv.write_text("SUPABASE_ACCESS_TOKEN=sbp_selected\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SUPABASE_ACCESS_TOKEN=sbp_local\n", encoding="utf-8")
+
+    shell_token = envguard.detect_supabase_access_token(
+        tmp_path,
+        selected_dotenv,
+        {"SUPABASE_ACCESS_TOKEN": "sbp_shell"},
+    )
+    selected_token = envguard.detect_supabase_access_token(tmp_path, selected_dotenv, {})
+    local_token = envguard.detect_supabase_access_token(tmp_path, tmp_path / ".env.missing", {})
+
+    assert shell_token == ("sbp_shell", "environment")
+    assert selected_token == ("sbp_selected", str(selected_dotenv))
+    assert local_token == ("sbp_local", str(tmp_path / ".env"))
+
+
+def test_run_wizard_uses_direct_token_only_for_current_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / ".env.example").write_text("DATABASE_URL=\n", encoding="utf-8")
+    (tmp_path / "supabase" / "functions").mkdir(parents=True)
+
+    answers = iter(
+        [
+            str(tmp_path),
+            str(tmp_path / ".env.example"),
+            "project-ref",
+            "sbp_direct_token",
+        ]
+    )
+    confirms = iter([True, False, False, True])
+    captured: dict[str, object] = {}
+
+    def fake_main(args: list[str]) -> None:
+        captured["args"] = args
+        captured["token"] = envguard.os.environ.get("SUPABASE_ACCESS_TOKEN")
+
+    monkeypatch.delenv("SUPABASE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(envguard, "_ask_text", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(envguard, "_ask_secret", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(envguard, "_ask_confirm", lambda *_args, **_kwargs: next(confirms))
+    monkeypatch.setattr(
+        envguard,
+        "detect_supabase_project_ref",
+        lambda *_args, **_kwargs: "project-ref",
+    )
+    monkeypatch.setattr(envguard, "main", fake_main)
+
+    envguard.run_wizard()
+
+    assert captured["args"] == [
+        "--path",
+        str(tmp_path.resolve()),
+        "--dotenv",
+        str(tmp_path / ".env.example"),
+        "--supabase-project",
+        "project-ref",
+    ]
+    assert captured["token"] == "sbp_direct_token"
+    assert envguard.os.environ.get("SUPABASE_ACCESS_TOKEN") is None
+    assert "sbp_direct_token" not in capsys.readouterr().out
 
 
 def test_parse_cli_args_accepts_wizard_command() -> None:
