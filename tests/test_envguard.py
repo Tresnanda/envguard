@@ -648,6 +648,44 @@ def test_run_update_uses_pipx_force_install(monkeypatch: pytest.MonkeyPatch) -> 
     ]
 
 
+def test_run_update_bootstraps_pipx_with_host_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    install_cmd = [
+        "/usr/bin/python3",
+        "-m",
+        "pipx",
+        "install",
+        "--force",
+        "git+https://github.com/Tresnanda/envguard.git",
+    ]
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/python3" if name == "python3" else None
+
+    def fake_exists(self: Path) -> bool:
+        return False
+
+    def fake_run(cmd: list[str], check: bool) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if cmd == install_cmd and calls.count(cmd) == 1:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(envguard.shutil, "which", fake_which)
+    monkeypatch.setattr(envguard.Path, "exists", fake_exists)
+    monkeypatch.setattr(envguard.subprocess, "run", fake_run)
+
+    assert envguard.run_update() == 0
+    assert calls == [
+        install_cmd,
+        ["/usr/bin/python3", "-m", "pip", "install", "--user", "pipx"],
+        ["/usr/bin/python3", "-m", "pipx", "ensurepath"],
+        install_cmd,
+    ]
+
+
 def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:
     envguard.write_project_config(
         tmp_path,

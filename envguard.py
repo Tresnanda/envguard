@@ -1711,21 +1711,67 @@ def interactive_fix(result: ScanResult, dotenv_path: Path):
 # ─── Self Update ─────────────────────────────────────────────────────────────
 
 
-def _pipx_update_command() -> List[str]:
+def _pipx_binary() -> Optional[str]:
     pipx = shutil.which("pipx")
     if pipx:
+        return pipx
+    local_pipx = Path.home() / ".local" / "bin" / "pipx"
+    if local_pipx.exists():
+        return str(local_pipx)
+    return None
+
+
+def _is_app_pipx_python(path: str) -> bool:
+    normalized = str(Path(path)).replace("\\", "/")
+    return f"/pipx/venvs/{DIST_NAME}/" in normalized
+
+
+def _host_python() -> Optional[str]:
+    for name in ("python3", "python"):
+        candidate = shutil.which(name)
+        if candidate and not _is_app_pipx_python(candidate):
+            return candidate
+    if not _is_app_pipx_python(sys.executable):
+        return sys.executable
+    return None
+
+
+def _pipx_update_command() -> List[str]:
+    pipx = _pipx_binary()
+    if pipx:
         return [pipx, "install", "--force", REPO_SPEC]
-    return [sys.executable, "-m", "pipx", "install", "--force", REPO_SPEC]
+    python = _host_python()
+    if python:
+        return [python, "-m", "pipx", "install", "--force", REPO_SPEC]
+    return []
+
+
+def _bootstrap_pipx(python: str) -> None:
+    print("pipx was not available; installing pipx and retrying...")
+    subprocess.run([python, "-m", "pip", "install", "--user", "pipx"], check=True)
+    subprocess.run([python, "-m", "pipx", "ensurepath"], check=True)
 
 
 def run_update() -> int:
     """Install the latest envguard from GitHub via pipx."""
     print(f"Updating {APP_NAME} from GitHub...")
+    command = _pipx_update_command()
+    if not command:
+        print("Update failed: could not find a usable Python or pipx.", file=sys.stderr)
+        return 1
     try:
-        subprocess.run(_pipx_update_command(), check=True)
+        subprocess.run(command, check=True)
     except subprocess.CalledProcessError as exc:
-        print(f"Update failed with exit code {exc.returncode}.", file=sys.stderr)
-        return exc.returncode or 1
+        if len(command) >= 3 and command[1:3] == ["-m", "pipx"]:
+            try:
+                _bootstrap_pipx(command[0])
+                subprocess.run(command, check=True)
+            except subprocess.CalledProcessError as retry_exc:
+                print(f"Update failed with exit code {retry_exc.returncode}.", file=sys.stderr)
+                return retry_exc.returncode or 1
+        else:
+            print(f"Update failed with exit code {exc.returncode}.", file=sys.stderr)
+            return exc.returncode or 1
     print(f"{APP_NAME} updated. Run `{APP_NAME}` again to use the latest version.")
     return 0
 
