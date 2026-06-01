@@ -57,3 +57,9 @@ def test_ci_checks_installer_script_syntax() -> None:
 
     assert "bash -n install.sh" in text
     assert 'ParseFile("install.ps1"' in text
+
+
+def test_ci_opts_into_current_node_runtime_for_actions() -> None:
+    text = _read(".github/workflows/ci.yml")
+
+    assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in text
