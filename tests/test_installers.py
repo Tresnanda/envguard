@@ -16,6 +16,9 @@ def test_unix_installer_uses_numbered_supabase_setup() -> None:
     assert "3) Skip Supabase token setup" in text
     assert "save_secret_to_shell_profile" in text
     assert "SUPABASE_ACCESS_TOKEN" in text
+    assert "Run $APP_NAME wizard now?" not in text
+    assert '"$APP_NAME" wizard' not in text
+    assert "Run envguard in your terminal to start the guided audit." in text
 
 
 def test_windows_installer_uses_numbered_supabase_setup() -> None:
@@ -27,3 +30,6 @@ def test_windows_installer_uses_numbered_supabase_setup() -> None:
     assert "3) Skip Supabase token setup" in text
     assert "Save-UserSecret" in text
     assert "SUPABASE_ACCESS_TOKEN" in text
+    assert "Run $AppName wizard now?" not in text
+    assert "& $AppName wizard" not in text
+    assert "Run envguard in your terminal to start the guided audit." in text

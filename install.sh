@@ -149,6 +149,4 @@ else
   log "Run: python -m pipx ensurepath"
 fi
 
-if has_tty && ask_yes_no "Run $APP_NAME wizard now?" "y"; then
-  "$APP_NAME" wizard
-fi
+log "Run envguard in your terminal to start the guided audit."

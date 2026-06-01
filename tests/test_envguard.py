@@ -414,11 +414,16 @@ def test_rich_output_hides_missing_reference_table_by_default(capsys) -> None:
         missing=["MISSING_KEY"],
     )
 
-    envguard._rich_output(result, dotenv_path=None, supabase_ref=None)
+    envguard._rich_output(
+        result,
+        dotenv_path=None,
+        supabase_ref=None,
+        details_command="envguard apps/web --details",
+    )
 
     out = capsys.readouterr().out
     assert "1 missing key detected" in out
-    assert "Use --details" in out
+    assert "envguard apps/web --details" in out
     assert "MISSING — Keys referenced in code but not in config" not in out
     assert "/repo/src/app.py:12" not in out
 
@@ -479,6 +484,12 @@ def test_parse_cli_args_accepts_update_command() -> None:
     args = envguard.parse_cli_args(["update"])
 
     assert args.command == "update"
+
+
+def test_build_details_command_adds_details_to_current_command() -> None:
+    assert envguard.build_details_command(["apps/web", "--exclude", "dist/**"]) == (
+        "envguard apps/web --exclude 'dist/**' --details"
+    )
 
 
 def test_run_update_uses_pipx_force_install(monkeypatch: pytest.MonkeyPatch) -> None:

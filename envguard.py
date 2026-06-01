@@ -1142,6 +1142,7 @@ def _rich_output(
     dotenv_path: Optional[Path],
     supabase_ref: Optional[str],
     show_details: bool = False,
+    details_command: Optional[str] = None,
 ):
     """Pretty terminal output using rich."""
     console = Console()
@@ -1179,10 +1180,9 @@ def _rich_output(
             console.print(table)
         else:
             label = "key" if len(result.unused) == 1 else "keys"
-            console.print(
-                f"[yellow]![/] {len(result.unused)} unused {label} found. "
-                "Use --details to show the table."
-            )
+            console.print(f"[yellow]![/] {len(result.unused)} unused {label} found.")
+            if details_command:
+                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
     else:
         console.print("[green]✓[/] No unused keys found in configuration.")
@@ -1206,10 +1206,9 @@ def _rich_output(
             console.print(table)
         else:
             label = "key" if len(result.missing) == 1 else "keys"
-            console.print(
-                f"[red]![/] {len(result.missing)} missing {label} detected. "
-                "Use --details to show references."
-            )
+            console.print(f"[red]![/] {len(result.missing)} missing {label} detected.")
+            if details_command:
+                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
     else:
         console.print("[green]✓[/] No missing keys detected.")
@@ -1230,8 +1229,10 @@ def _rich_output(
             label = "secret" if len(result.supabase_orphans) == 1 else "secrets"
             console.print(
                 f"[magenta]![/] {len(result.supabase_orphans)} orphaned Supabase "
-                f"{label} found. Use --details to show the table."
+                f"{label} found."
             )
+            if details_command:
+                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
 
     # Overall status
@@ -1239,7 +1240,7 @@ def _rich_output(
         if show_details:
             console.print("[bold red]✗[/] Issues found. Review the tables above.")
         else:
-            console.print("[bold red]✗[/] Issues found. Run again with --details for tables.")
+            console.print("[bold red]✗[/] Issues found.")
     else:
         console.print("[bold green]✓[/] All environment variables are accounted for!")
 
@@ -1469,6 +1470,14 @@ def prompt_for_update_if_available() -> bool:
         run_update()
         return True
     return False
+
+
+def build_details_command(raw_argv: List[str]) -> str:
+    """Build the command that repeats the current rich report with details enabled."""
+    args = list(raw_argv)
+    if "--details" not in args:
+        args.append("--details")
+    return "envguard " + " ".join(shlex.quote(arg) for arg in args)
 
 
 # ─── CLI Entry Point ───────────────────────────────────────────────────────
@@ -1743,6 +1752,7 @@ def main(argv: Optional[List[str]] = None):
                 dotenv_path if dotenv_path.exists() else None,
                 supabase_project,
                 show_details=args.details,
+                details_command=build_details_command(raw_argv),
             )
 
     # ── Interactive fix ────────────────────────────────────────────────────

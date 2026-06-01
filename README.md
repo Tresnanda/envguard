@@ -38,7 +38,7 @@ For unattended installs, pass `--yes`:
 curl -fsSL https://raw.githubusercontent.com/Tresnanda/envguard/main/install.sh | bash -s -- --yes
 ```
 
-The installer uses `pipx`, checks Python and optional Supabase tooling, then offers a simple numbered Supabase token setup. If you paste `SUPABASE_ACCESS_TOKEN` during install, it is saved to your user shell environment, not to project config. The installer then offers to launch `envguard wizard`. The wizard checks for a newer GitHub version and asks before updating.
+The installer uses `pipx`, checks Python and optional Supabase tooling, then offers a simple numbered Supabase token setup. If you paste `SUPABASE_ACCESS_TOKEN` during install, it is saved to your user shell environment, not to project config. After install, run `envguard` in your terminal to start the guided audit. The wizard checks for a newer GitHub version and asks before updating.
 
 Manual install:
 
