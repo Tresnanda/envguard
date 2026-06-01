@@ -20,6 +20,28 @@ It reports three classes of issues:
 
 Requires Python 3.9 or newer.
 
+macOS/Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tresnanda/envguard/main/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Tresnanda/envguard/main/install.ps1 | iex
+```
+
+For unattended installs, pass `--yes`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tresnanda/envguard/main/install.sh | bash -s -- --yes
+```
+
+The installer uses `pipx`, checks Python and optional Supabase tooling, then offers to launch `envguard wizard`.
+
+Manual install:
+
 ```bash
 pipx install .
 ```
