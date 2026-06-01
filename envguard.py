@@ -1772,10 +1772,37 @@ def _pipx_update_command() -> List[str]:
     return [python, "-m", "pipx", "install", "--python", python, "--force", REPO_SPEC]
 
 
-def _bootstrap_pipx(python: str) -> None:
-    print("pipx was not available; installing pipx and retrying...")
-    subprocess.run([python, "-m", "pip", "install", "--user", "pipx"], check=True)
-    subprocess.run([python, "-m", "pipx", "ensurepath"], check=True)
+def _data_home() -> Path:
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home)
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data)
+    return Path.home() / ".local" / "share"
+
+
+def _pipx_bootstrap_dir() -> Path:
+    return _data_home() / APP_NAME / "pipx-bootstrap"
+
+
+def _bootstrap_pipx(python: str) -> str:
+    print("pipx was not available; installing a private pipx helper and retrying...")
+    venv_dir = _pipx_bootstrap_dir()
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([python, "-m", "venv", str(venv_dir)], check=True)
+    if os.name == "nt":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+        pipx = venv_dir / "Scripts" / "pipx.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+        pipx = venv_dir / "bin" / "pipx"
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "pipx"],
+        check=True,
+    )
+    return str(pipx)
 
 
 def run_update() -> int:
@@ -1790,8 +1817,9 @@ def run_update() -> int:
     except subprocess.CalledProcessError as exc:
         if len(command) >= 3 and command[1:3] == ["-m", "pipx"]:
             try:
-                _bootstrap_pipx(command[0])
-                subprocess.run(command, check=True)
+                pipx = _bootstrap_pipx(command[0])
+                retry_command = [pipx, "install", "--python", command[0], "--force", REPO_SPEC]
+                subprocess.run(retry_command, check=True)
             except subprocess.CalledProcessError as retry_exc:
                 print(f"Update failed with exit code {retry_exc.returncode}.", file=sys.stderr)
                 return retry_exc.returncode or 1

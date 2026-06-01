@@ -98,6 +98,37 @@ function Invoke-Pipx([string[]]$Arguments) {
     & $exe @allArgs
 }
 
+function Get-DataHome {
+    if ($env:LOCALAPPDATA) { return $env:LOCALAPPDATA }
+    if ($env:XDG_DATA_HOME) { return $env:XDG_DATA_HOME }
+    return (Join-Path $HOME ".local/share")
+}
+
+function Get-PipxBinDir {
+    if ($env:PIPX_BIN_DIR) { return $env:PIPX_BIN_DIR }
+    return (Join-Path $HOME ".local/bin")
+}
+
+function Initialize-PipxBootstrap {
+    $venvDir = Join-Path (Join-Path (Get-DataHome) $AppName) "pipx-bootstrap"
+    Write-Host "pipx was not found; installing a private pipx helper..."
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $venvDir) *> $null
+    & $Python @("-m", "venv", $venvDir)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create a Python virtual environment for pipx. Install pipx manually, then rerun this installer."
+    }
+    $venvPython = Join-Path $venvDir "Scripts/python.exe"
+    if (-not (Test-Path $venvPython)) {
+        $venvPython = Join-Path $venvDir "bin/python"
+    }
+    & $venvPython @("-m", "pip", "install", "--upgrade", "pip", "pipx")
+    $pipxExe = Join-Path $venvDir "Scripts/pipx.exe"
+    if (-not (Test-Path $pipxExe)) {
+        $pipxExe = Join-Path $venvDir "bin/pipx"
+    }
+    $script:PipxCommand = @($pipxExe)
+}
+
 function Find-Python {
     $candidates = @(
         @("py", "-3.13"),
@@ -186,8 +217,7 @@ if (Get-Command pipx -ErrorAction SilentlyContinue) {
         Write-Host "[ok] pipx found"
     } catch {
         if (Confirm-Step "Install pipx with this Python?" $true) {
-            & $Python -m pip install --user pipx
-            & $Python -m pipx ensurepath *> $null
+            Initialize-PipxBootstrap
         } else {
             throw "Install pipx and rerun this installer."
         }
@@ -209,7 +239,7 @@ if (Get-Command $AppName -ErrorAction SilentlyContinue) {
     Write-Host "[ok] $AppName installed"
 } else {
     Write-Host "[warn] $AppName installed, but pipx bin dir may not be on PATH."
-    Write-Host "Run: python -m pipx ensurepath"
+    Write-Host "Run: `$env:Path = `"$(Get-PipxBinDir);`$env:Path`""
 }
 
 Offer-StarRepo

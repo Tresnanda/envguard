@@ -701,6 +701,7 @@ def test_run_update_bootstraps_pipx_with_host_python(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
+    bootstrap_dir = Path("/tmp/envguard-pipx-bootstrap")
     install_cmd = [
         "/usr/bin/python3.11",
         "-m",
@@ -725,6 +726,7 @@ def test_run_update_bootstraps_pipx_with_host_python(
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(envguard, "_python_version_ok", lambda path: True)
+    monkeypatch.setattr(envguard, "_pipx_bootstrap_dir", lambda: bootstrap_dir)
     monkeypatch.setattr(envguard.shutil, "which", fake_which)
     monkeypatch.setattr(envguard.Path, "exists", fake_exists)
     monkeypatch.setattr(envguard.subprocess, "run", fake_run)
@@ -732,9 +734,24 @@ def test_run_update_bootstraps_pipx_with_host_python(
     assert envguard.run_update() == 0
     assert calls == [
         install_cmd,
-        ["/usr/bin/python3.11", "-m", "pip", "install", "--user", "pipx"],
-        ["/usr/bin/python3.11", "-m", "pipx", "ensurepath"],
-        install_cmd,
+        ["/usr/bin/python3.11", "-m", "venv", str(bootstrap_dir)],
+        [
+            str(bootstrap_dir / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "pip",
+            "pipx",
+        ],
+        [
+            str(bootstrap_dir / "bin" / "pipx"),
+            "install",
+            "--python",
+            "/usr/bin/python3.11",
+            "--force",
+            "git+https://github.com/Tresnanda/envguard.git",
+        ],
     ]
 
 
