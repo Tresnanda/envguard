@@ -50,3 +50,10 @@ def test_windows_installer_uses_numbered_supabase_setup() -> None:
     assert "api.github.com/user/starred/$RepoSlug" in text
     assert "Star it here: $RepoUrl" in text
     assert "Run envguard in your terminal to start the guided audit." in text
+
+
+def test_ci_checks_installer_script_syntax() -> None:
+    text = _read(".github/workflows/ci.yml")
+
+    assert "bash -n install.sh" in text
+    assert 'ParseFile("install.ps1"' in text

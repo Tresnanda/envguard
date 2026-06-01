@@ -27,6 +27,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Check installer script syntax
+        shell: bash
+        run: |
+          bash -n install.sh
+          pwsh -NoProfile -Command '$tokens = $null; $errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref] $tokens, [ref] $errors); if ($errors.Count) { $errors | Format-List *; exit 1 }'
+
       - name: Install project and dev tools
         run: |
           python -m pip install --upgrade pip
