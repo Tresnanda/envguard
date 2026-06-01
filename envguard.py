@@ -12,11 +12,12 @@ import html
 import json
 import os
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 try:
     import tomllib
@@ -27,12 +28,13 @@ try:
     from rich import print as rprint
     from rich.console import Console
     from rich.panel import Panel
-    from rich.prompt import Confirm
+    from rich.prompt import Confirm, Prompt
     from rich.table import Table
 except ImportError:
     Console = None  # type: ignore
     Table = None  # type: ignore
     Confirm = None  # type: ignore
+    Prompt = None  # type: ignore
     Panel = None  # type: ignore
     rprint = print  # fallback
 
@@ -364,6 +366,144 @@ def write_project_config(
         updated = existing.rstrip() + "\n\n" + new_block
     pyproject_path.write_text(updated, encoding="utf-8")
     return pyproject_path
+
+
+# ─── Project auto-detection ─────────────────────────────────────────────────
+
+
+DOTENV_CANDIDATES = (".env.example", ".env.sample", ".env.template", ".env")
+
+
+def discover_dotenv_path(scan_path: Path, config: EnvguardConfig) -> Optional[Path]:
+    """Find the best dotenv template for a scanned project."""
+    project_root = scan_path if scan_path.is_dir() else scan_path.parent
+    if config.dotenv:
+        configured = _resolve_config_path(config.dotenv, scan_path)
+        if configured.exists():
+            return configured
+
+    for name in DOTENV_CANDIDATES:
+        candidate = project_root / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def detect_supabase_project_ref(
+    scan_path: Path,
+    env: Mapping[str, str],
+    config: EnvguardConfig,
+) -> Optional[str]:
+    """Detect a Supabase project reference from config files or environment."""
+    if config.supabase_project:
+        return config.supabase_project
+
+    project_root = scan_path if scan_path.is_dir() or not scan_path.exists() else scan_path.parent
+    supabase_config = project_root / "supabase" / "config.toml"
+    if supabase_config.exists():
+        try:
+            data = tomllib.loads(supabase_config.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            data = {}
+        for key in ("project_id", "project_ref", "ref"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return env.get("SUPABASE_PROJECT_REF") or env.get("SUPABASE_PROJECT_ID")
+
+
+def has_supabase_edge_functions(scan_path: Path) -> bool:
+    """Return True when a project contains local Supabase Edge Functions."""
+    project_root = scan_path if scan_path.is_dir() else scan_path.parent
+    functions_dir = project_root / "supabase" / "functions"
+    return functions_dir.exists()
+
+
+def should_auto_fetch_supabase(
+    scan_path: Path,
+    project_ref: Optional[str],
+    env: Mapping[str, str],
+) -> bool:
+    """Return True when envguard can safely include Supabase remote secrets."""
+    return bool(
+        project_ref
+        and env.get("SUPABASE_ACCESS_TOKEN")
+        and has_supabase_edge_functions(scan_path)
+    )
+
+
+def build_wizard_args(answers: Mapping[str, object]) -> List[str]:
+    """Build a deterministic envguard command from wizard answers."""
+    args: List[str] = ["--path", str(answers.get("path") or ".")]
+    dotenv = answers.get("dotenv")
+    if dotenv:
+        args.extend(["--dotenv", str(dotenv)])
+    if answers.get("github_annotations"):
+        args.append("--github-annotations")
+    if answers.get("fix"):
+        args.append("--fix")
+    if answers.get("use_supabase") and answers.get("supabase_project"):
+        args.extend(["--supabase-project", str(answers["supabase_project"])])
+    return args
+
+
+def _ask_text(message: str, default: Optional[str] = None) -> str:
+    if Prompt is not None:
+        return Prompt.ask(message, default=default)
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{message}{suffix}: ").strip()
+    return value or (default or "")
+
+
+def _ask_confirm(message: str, default: bool = False) -> bool:
+    if Confirm is not None:
+        return Confirm.ask(message, default=default)
+    suffix = "Y/n" if default else "y/N"
+    value = input(f"{message} [{suffix}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes"}
+
+
+def _format_command(args: List[str]) -> str:
+    return "envguard " + " ".join(shlex.quote(item) for item in args)
+
+
+def run_wizard() -> None:
+    """Interactive command builder for envguard."""
+    scan_path = Path(_ask_text("Project path", ".")).expanduser().resolve()
+    config = load_project_config(scan_path)
+    detected_dotenv = discover_dotenv_path(scan_path, config)
+    detected_supabase = detect_supabase_project_ref(scan_path, os.environ, config)
+    edge_functions = has_supabase_edge_functions(scan_path)
+
+    dotenv_default = str(detected_dotenv) if detected_dotenv else ""
+    dotenv = _ask_text("Dotenv template", dotenv_default) if dotenv_default else ""
+    use_supabase_default = bool(detected_supabase and os.environ.get("SUPABASE_ACCESS_TOKEN"))
+    use_supabase = False
+    supabase_project = detected_supabase or ""
+    if edge_functions or detected_supabase:
+        use_supabase = _ask_confirm("Compare Supabase Edge Function secrets", use_supabase_default)
+        if use_supabase:
+            supabase_project = _ask_text("Supabase project ref", supabase_project)
+            if not os.environ.get("SUPABASE_ACCESS_TOKEN"):
+                print("Tip: set SUPABASE_ACCESS_TOKEN to fetch remote Supabase secrets.")
+                use_supabase = False
+
+    args = build_wizard_args(
+        {
+            "path": str(scan_path),
+            "dotenv": dotenv,
+            "use_supabase": use_supabase,
+            "supabase_project": supabase_project,
+            "github_annotations": _ask_confirm("Use GitHub Actions annotations", False),
+            "fix": _ask_confirm("Offer to prune unused dotenv keys", False),
+        }
+    )
+    print(f"\nGenerated command:\n  {_format_command(args)}\n")
+    if _ask_confirm("Run it now", True):
+        main(args)
 
 
 # ─── .env.example parsing ──────────────────────────────────────────────────
@@ -747,19 +887,21 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  envguard                          Scan current directory\n"
+            "  envguard                          Guided audit on interactive terminals\n"
+            "  envguard wizard                   Build the right command interactively\n"
             "  envguard apps/web                  Scan a specific project\n"
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard supabase xyz              Compare with Supabase secrets\n"
             "  envguard init                      Write [tool.envguard] defaults\n"
             "  envguard --json                    Machine-readable output\n"
+            "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
         ),
     )
     parser.add_argument(
         "tokens",
         nargs="*",
-        help="Optional project path or preset: ci, supabase <project-ref>, init",
+        help="Optional project path or preset: wizard, ci, supabase <project-ref>, init",
     )
     parser.add_argument(
         "--path",
@@ -792,7 +934,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dotenv",
         type=str,
         default=None,
-        help="Path to .env.example file (default: <path>/.env.example)",
+        help="Path to dotenv template (default: auto-detect .env.example/.env.sample)",
     )
     parser.add_argument(
         "--debug",
@@ -819,6 +961,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not fail when referenced variables are missing from configuration",
     )
+    parser.add_argument(
+        "--no-wizard",
+        action="store_true",
+        help="Run the default current-directory scan instead of the interactive guide",
+    )
     return parser
 
 
@@ -837,6 +984,10 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                 parser.error("ci accepts at most one project path")
             if len(tokens) == 2:
                 args.path = tokens[1]
+        elif first == "wizard":
+            args.command = "wizard"
+            if len(tokens) > 1:
+                parser.error("wizard does not accept extra arguments")
         elif first == "supabase":
             if len(tokens) < 2:
                 parser.error("supabase requires a project reference")
@@ -861,7 +1012,17 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_cli_args(argv)
+
+    if args.command == "wizard" or (
+        not raw_argv
+        and not args.no_wizard
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    ):
+        run_wizard()
+        return
 
     # Resolve paths
     scan_path = Path(args.path).resolve()
@@ -881,16 +1042,20 @@ def main(argv: Optional[List[str]] = None):
 
     config = load_project_config(scan_path)
 
-    # Determine .env.example path
+    # Determine dotenv path
     if args.dotenv:
         dotenv_path = Path(args.dotenv).resolve()
-    elif config.dotenv:
-        dotenv_path = _resolve_config_path(config.dotenv, scan_path).resolve()
     else:
-        dotenv_path = scan_path / ".env.example"
+        detected_dotenv = discover_dotenv_path(scan_path, config)
+        dotenv_path = detected_dotenv.resolve() if detected_dotenv else scan_path / ".env.example"
 
     exclude_patterns = [*config.exclude, *args.exclude]
-    supabase_project = args.supabase_project or config.supabase_project
+    explicit_supabase_project = args.supabase_project is not None
+    supabase_project = args.supabase_project or detect_supabase_project_ref(
+        scan_path,
+        os.environ,
+        config,
+    )
 
     # ── Scan codebase ──────────────────────────────────────────────────────
     ref_map = scan_directory(scan_path, exclude_patterns=exclude_patterns)
@@ -917,16 +1082,32 @@ def main(argv: Optional[List[str]] = None):
     if supabase_project:
         access_token = os.environ.get("SUPABASE_ACCESS_TOKEN")
         if not access_token:
+            if explicit_supabase_project:
+                print(
+                    "Error: SUPABASE_ACCESS_TOKEN environment variable is required "
+                    "when using --supabase-project",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if args.debug and has_supabase_edge_functions(scan_path):
+                print(
+                    "[debug] Supabase project detected, but SUPABASE_ACCESS_TOKEN "
+                    "is not set; skipping remote secrets."
+                )
+        elif explicit_supabase_project or should_auto_fetch_supabase(
+            scan_path,
+            supabase_project,
+            os.environ,
+        ):
+            if args.debug:
+                print(f"[debug] Fetching secrets for Supabase project: {supabase_project}")
+            supabase_keys = fetch_supabase_secrets(supabase_project, access_token)
+        elif args.debug:
             print(
-                "Error: SUPABASE_ACCESS_TOKEN environment variable is required "
-                "when using --supabase-project",
-                file=sys.stderr,
+                f"[debug] Supabase project detected ({supabase_project}), but no "
+                "local Edge Functions were found; skipping remote secrets."
             )
-            sys.exit(1)
-        if args.debug:
-            print(f"[debug] Fetching secrets for Supabase project: {supabase_project}")
-        supabase_keys = fetch_supabase_secrets(supabase_project, access_token)
-        if args.debug:
+        if args.debug and supabase_keys is not None:
             print(f"[debug] Supabase secrets ({len(supabase_keys)}): {supabase_keys}")
             print()
 

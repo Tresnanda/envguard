@@ -40,6 +40,18 @@ Run the audit from the root of a project that contains `.env.example`:
 envguard
 ```
 
+On an interactive terminal, the bare command opens a guided command builder. It detects common dotenv templates, Supabase Edge Function projects, and existing project config, then shows the generated command before running it. To force the immediate current-directory scan, use:
+
+```bash
+envguard --no-wizard
+```
+
+You can also open the guide explicitly:
+
+```bash
+envguard wizard
+```
+
 Scan another directory:
 
 ```bash
@@ -100,6 +112,8 @@ When Supabase secrets are included:
 
 Create an access token at [app.supabase.com/account/tokens](https://app.supabase.com/account/tokens). Your project reference is the ID in a Supabase project URL such as `https://app.supabase.com/project/your-project-ref`.
 
+`envguard` also detects Supabase projects automatically from `[tool.envguard]`, `supabase/config.toml`, `SUPABASE_PROJECT_REF`, or `SUPABASE_PROJECT_ID`. Remote secrets are fetched only when a project ref is known, `SUPABASE_ACCESS_TOKEN` is set, and local Edge Functions are present, so ordinary scans stay predictable.
+
 ## `.env.example` Format
 
 `envguard` accepts standard dotenv-style keys:
@@ -155,11 +169,12 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 usage: envguard [-h] [--path PATH] [--json] [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--debug] [--exclude PATTERN]
-                [--allow-unused] [--allow-missing]
-                [path|ci|supabase|init] [...]
+                [--allow-unused] [--allow-missing] [--no-wizard]
+                [path|wizard|ci|supabase|init] [...]
 
 options:
   path                  Optional project path, e.g. envguard apps/web.
+  wizard                Build and optionally run an audit command interactively.
   ci [path]             Shortcut for GitHub Actions annotations.
   supabase ID [path]    Shortcut for Supabase secret comparison.
   init [path]           Write or update [tool.envguard] in pyproject.toml.
@@ -173,6 +188,7 @@ options:
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
   --allow-unused        Do not fail on unused keys or orphaned Supabase secrets.
   --allow-missing       Do not fail on missing referenced variables.
+  --no-wizard           Run the default scan instead of the interactive guide.
   --debug               Print detected references and parsed keys.
 ```
 

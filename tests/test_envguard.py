@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import envguard
 
 
@@ -209,3 +211,106 @@ def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:
             "",
         ]
     )
+
+
+def test_discover_dotenv_path_prefers_templates_before_dotenv(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("SECRET=value\n", encoding="utf-8")
+    (tmp_path / ".env.sample").write_text("SECRET=\n", encoding="utf-8")
+
+    detected = envguard.discover_dotenv_path(tmp_path, envguard.EnvguardConfig())
+
+    assert detected == tmp_path / ".env.sample"
+
+
+def test_detect_supabase_project_ref_reads_config_and_environment(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "supabase").mkdir()
+    (tmp_path / "supabase" / "config.toml").write_text(
+        'project_id = "local-ref"\n',
+        encoding="utf-8",
+    )
+
+    detected = envguard.detect_supabase_project_ref(
+        tmp_path,
+        env={},
+        config=envguard.EnvguardConfig(),
+    )
+    fallback = envguard.detect_supabase_project_ref(
+        tmp_path / "missing",
+        env={"SUPABASE_PROJECT_REF": "env-ref"},
+        config=envguard.EnvguardConfig(),
+    )
+
+    assert detected == "local-ref"
+    assert fallback == "env-ref"
+
+
+def test_should_auto_fetch_supabase_requires_ref_token_and_edge_functions(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "supabase" / "functions").mkdir(parents=True)
+
+    assert envguard.should_auto_fetch_supabase(
+        tmp_path,
+        "project-ref",
+        {"SUPABASE_ACCESS_TOKEN": "token"},
+    )
+    assert not envguard.should_auto_fetch_supabase(tmp_path, "project-ref", {})
+    assert not envguard.should_auto_fetch_supabase(
+        tmp_path,
+        None,
+        {"SUPABASE_ACCESS_TOKEN": "token"},
+    )
+
+
+def test_parse_cli_args_accepts_wizard_command() -> None:
+    args = envguard.parse_cli_args(["wizard"])
+
+    assert args.command == "wizard"
+
+
+def test_build_wizard_args_uses_detected_defaults(tmp_path: Path) -> None:
+    dotenv = tmp_path / ".env.example"
+    dotenv.write_text("DATABASE_URL=\n", encoding="utf-8")
+
+    args = envguard.build_wizard_args(
+        {
+            "path": str(tmp_path),
+            "dotenv": str(dotenv),
+            "use_supabase": True,
+            "supabase_project": "project-ref",
+            "github_annotations": False,
+            "fix": False,
+        }
+    )
+
+    assert args == [
+        "--path",
+        str(tmp_path),
+        "--dotenv",
+        str(dotenv),
+        "--supabase-project",
+        "project-ref",
+    ]
+
+
+def test_main_opens_wizard_for_bare_interactive_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = {"wizard": False}
+
+    class Tty:
+        def isatty(self) -> bool:
+            return True
+
+    def fake_wizard() -> None:
+        called["wizard"] = True
+
+    monkeypatch.setattr(envguard.sys, "stdin", Tty())
+    monkeypatch.setattr(envguard.sys, "stdout", Tty())
+    monkeypatch.setattr(envguard, "run_wizard", fake_wizard)
+
+    envguard.main([])
+
+    assert called["wizard"] is True
