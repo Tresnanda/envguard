@@ -10,10 +10,13 @@ from __future__ import annotations
 import argparse
 import getpass
 import html
+import importlib.metadata
 import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
@@ -38,6 +41,12 @@ except ImportError:
     Prompt = None  # type: ignore
     Panel = None  # type: ignore
     rprint = print  # fallback
+
+
+APP_NAME = "envguard"
+DIST_NAME = "envguard"
+REPO_URL = "https://github.com/Tresnanda/envguard.git"
+REPO_SPEC = f"git+{REPO_URL}"
 
 
 # ─── Data Structures ───────────────────────────────────────────────────────
@@ -77,6 +86,15 @@ class EnvguardConfig:
     dotenv: Optional[str] = None
     exclude: List[str] = field(default_factory=list)
     supabase_project: Optional[str] = None
+
+
+@dataclass
+class UpdateCheck:
+    """Result of a best-effort GitHub update check."""
+
+    available: bool
+    current_commit: Optional[str] = None
+    latest_commit: Optional[str] = None
 
 
 # ─── Detection Patterns ────────────────────────────────────────────────────
@@ -1119,7 +1137,12 @@ def analyze(
 # ─── Output Formatting ─────────────────────────────────────────────────────
 
 
-def _rich_output(result: ScanResult, dotenv_path: Optional[Path], supabase_ref: Optional[str]):
+def _rich_output(
+    result: ScanResult,
+    dotenv_path: Optional[Path],
+    supabase_ref: Optional[str],
+    show_details: bool = False,
+):
     """Pretty terminal output using rich."""
     console = Console()
 
@@ -1137,42 +1160,56 @@ def _rich_output(result: ScanResult, dotenv_path: Optional[Path], supabase_ref: 
     console.print(Panel(summary, border_style="cyan"))
     console.print()
 
-    # UNUSED keys table
+    # UNUSED keys
     if result.unused:
-        table = Table(
-            title="[yellow]UNUSED[/] — Keys in config but never referenced in code",
-            border_style="yellow",
-        )
-        table.add_column("Key", style="yellow", no_wrap=True)
-        table.add_column("Source", style="dim")
-        for key in result.unused:
-            source = (
-                "supabase"
-                if supabase_ref and key in result.supabase_orphans
-                else ".env.example"
+        if show_details:
+            table = Table(
+                title="[yellow]UNUSED[/] — Keys in config but never referenced in code",
+                border_style="yellow",
             )
-            table.add_row(key, source)
-        console.print(table)
+            table.add_column("Key", style="yellow", no_wrap=True)
+            table.add_column("Source", style="dim")
+            for key in result.unused:
+                source = (
+                    "supabase"
+                    if supabase_ref and key in result.supabase_orphans
+                    else ".env.example"
+                )
+                table.add_row(key, source)
+            console.print(table)
+        else:
+            label = "key" if len(result.unused) == 1 else "keys"
+            console.print(
+                f"[yellow]![/] {len(result.unused)} unused {label} found. "
+                "Use --details to show the table."
+            )
         console.print()
     else:
         console.print("[green]✓[/] No unused keys found in configuration.")
         console.print()
 
-    # MISSING keys table
+    # MISSING keys
     if result.missing:
-        table = Table(
-            title="[red]MISSING[/] — Keys referenced in code but not in config",
-            border_style="red",
-        )
-        table.add_column("Key", style="red", no_wrap=True)
-        table.add_column("References", style="dim")
-        for key in result.missing:
-            refs = result.references.get(key, [])
-            locs = "; ".join(f"{r.file}:{r.line}" for r in refs[:3])
-            if len(refs) > 3:
-                locs += f" …and {len(refs)-3} more"
-            table.add_row(key, locs)
-        console.print(table)
+        if show_details:
+            table = Table(
+                title="[red]MISSING[/] — Keys referenced in code but not in config",
+                border_style="red",
+            )
+            table.add_column("Key", style="red", no_wrap=True)
+            table.add_column("References", style="dim")
+            for key in result.missing:
+                refs = result.references.get(key, [])
+                locs = "; ".join(f"{r.file}:{r.line}" for r in refs[:3])
+                if len(refs) > 3:
+                    locs += f" …and {len(refs)-3} more"
+                table.add_row(key, locs)
+            console.print(table)
+        else:
+            label = "key" if len(result.missing) == 1 else "keys"
+            console.print(
+                f"[red]![/] {len(result.missing)} missing {label} detected. "
+                "Use --details to show references."
+            )
         console.print()
     else:
         console.print("[green]✓[/] No missing keys detected.")
@@ -1180,21 +1217,29 @@ def _rich_output(result: ScanResult, dotenv_path: Optional[Path], supabase_ref: 
 
     # Supabase orphans
     if result.supabase_orphans:
-        table = Table(
-            title="[magenta]ORPHANED[/] — Supabase secrets with no code references",
-            border_style="magenta",
-        )
-        table.add_column("Secret", style="magenta", no_wrap=True)
-        for key in result.supabase_orphans:
-            table.add_row(key)
-        console.print(table)
+        if show_details:
+            table = Table(
+                title="[magenta]ORPHANED[/] — Supabase secrets with no code references",
+                border_style="magenta",
+            )
+            table.add_column("Secret", style="magenta", no_wrap=True)
+            for key in result.supabase_orphans:
+                table.add_row(key)
+            console.print(table)
+        else:
+            label = "secret" if len(result.supabase_orphans) == 1 else "secrets"
+            console.print(
+                f"[magenta]![/] {len(result.supabase_orphans)} orphaned Supabase "
+                f"{label} found. Use --details to show the table."
+            )
         console.print()
 
     # Overall status
     if result.unused or result.missing or result.supabase_orphans:
-        console.print(
-            "[bold red]✗[/] Issues found. Review the tables above."
-        )
+        if show_details:
+            console.print("[bold red]✗[/] Issues found. Review the tables above.")
+        else:
+            console.print("[bold red]✗[/] Issues found. Run again with --details for tables.")
     else:
         console.print("[bold green]✓[/] All environment variables are accounted for!")
 
@@ -1342,6 +1387,90 @@ def interactive_fix(result: ScanResult, dotenv_path: Path):
         console.print("[dim]No changes made.[/]")
 
 
+# ─── Self Update ─────────────────────────────────────────────────────────────
+
+
+def _pipx_update_command() -> List[str]:
+    pipx = shutil.which("pipx")
+    if pipx:
+        return [pipx, "install", "--force", REPO_SPEC]
+    return [sys.executable, "-m", "pipx", "install", "--force", REPO_SPEC]
+
+
+def run_update() -> int:
+    """Install the latest envguard from GitHub via pipx."""
+    print(f"Updating {APP_NAME} from GitHub...")
+    try:
+        subprocess.run(_pipx_update_command(), check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"Update failed with exit code {exc.returncode}.", file=sys.stderr)
+        return exc.returncode or 1
+    print(f"{APP_NAME} updated. Run `{APP_NAME}` again to use the latest version.")
+    return 0
+
+
+def _installed_git_commit() -> Optional[str]:
+    try:
+        distribution = importlib.metadata.distribution(DIST_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+    for file in distribution.files or []:
+        if str(file).endswith("direct_url.json"):
+            try:
+                data = json.loads(distribution.locate_file(file).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            vcs_info = data.get("vcs_info", {})
+            commit = vcs_info.get("commit_id")
+            return commit if isinstance(commit, str) else None
+    return None
+
+
+def _latest_git_commit(timeout: float = 3.0) -> Optional[str]:
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        result = subprocess.run(
+            [git, "ls-remote", REPO_URL, "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split()
+    return fields[0] if fields else None
+
+
+def check_for_update() -> UpdateCheck:
+    """Best-effort update check for pipx installs from GitHub."""
+    if os.environ.get("ENVGUARD_SKIP_UPDATE_CHECK"):
+        return UpdateCheck(available=False)
+    current_commit = _installed_git_commit()
+    latest_commit = _latest_git_commit()
+    if not current_commit or not latest_commit:
+        return UpdateCheck(False, current_commit, latest_commit)
+    return UpdateCheck(current_commit != latest_commit, current_commit, latest_commit)
+
+
+def prompt_for_update_if_available() -> bool:
+    """Prompt in interactive flows. Return True when an update was attempted."""
+    if Confirm is None:
+        return False
+    check = check_for_update()
+    if not check.available:
+        return False
+    if Confirm.ask(f"New {APP_NAME} update found. Update now?", default=False):
+        run_update()
+        return True
+    return False
+
+
 # ─── CLI Entry Point ───────────────────────────────────────────────────────
 
 
@@ -1357,7 +1486,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard supabase xyz              Compare with Supabase secrets\n"
             "  envguard init                      Write [tool.envguard] defaults\n"
+            "  envguard update                    Update envguard from GitHub\n"
             "  envguard --json                    Machine-readable output\n"
+            "  envguard --details                 Show detailed issue tables\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
         ),
@@ -1365,7 +1496,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "tokens",
         nargs="*",
-        help="Optional project path or preset: wizard, ci, supabase <project-ref>, init",
+        help="Optional project path or preset: wizard, ci, supabase <project-ref>, init, update",
     )
     parser.add_argument(
         "--path",
@@ -1404,6 +1535,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="Print debug info (detected references, etc.)",
+    )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="Show detailed issue tables with references in rich output",
     )
     parser.add_argument(
         "--exclude",
@@ -1452,6 +1588,10 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             args.command = "wizard"
             if len(tokens) > 1:
                 parser.error("wizard does not accept extra arguments")
+        elif first == "update":
+            args.command = "update"
+            if len(tokens) > 1:
+                parser.error("update does not accept extra arguments")
         elif first == "supabase":
             if len(tokens) < 2:
                 parser.error("supabase requires a project reference")
@@ -1479,12 +1619,20 @@ def main(argv: Optional[List[str]] = None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_cli_args(argv)
 
+    if args.command == "update":
+        status = run_update()
+        if status:
+            sys.exit(status)
+        return
+
     if args.command == "wizard" or (
         not raw_argv
         and not args.no_wizard
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
+        if prompt_for_update_if_available():
+            return
         run_wizard()
         return
 
@@ -1594,6 +1742,7 @@ def main(argv: Optional[List[str]] = None):
                 result,
                 dotenv_path if dotenv_path.exists() else None,
                 supabase_project,
+                show_details=args.details,
             )
 
     # ── Interactive fix ────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -398,6 +399,57 @@ def test_github_annotations_include_file_line_and_messages() -> None:
     ]
 
 
+def test_rich_output_hides_missing_reference_table_by_default(capsys) -> None:
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file="/repo/src/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        missing=["MISSING_KEY"],
+    )
+
+    envguard._rich_output(result, dotenv_path=None, supabase_ref=None)
+
+    out = capsys.readouterr().out
+    assert "1 missing key detected" in out
+    assert "Use --details" in out
+    assert "MISSING — Keys referenced in code but not in config" not in out
+    assert "/repo/src/app.py:12" not in out
+
+
+def test_rich_output_can_show_missing_reference_table(capsys) -> None:
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file="/repo/src/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        missing=["MISSING_KEY"],
+    )
+
+    envguard._rich_output(
+        result,
+        dotenv_path=None,
+        supabase_ref=None,
+        show_details=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "MISSING" in out
+    assert "/repo/src/app.py:12" in out
+
+
 def test_allow_flags_control_blocking_issue_detection() -> None:
     result = envguard.ScanResult(
         unused=["OLD_KEY"],
@@ -421,6 +473,34 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
 
     supabase = envguard.parse_cli_args(["supabase", "abcd1234"])
     assert supabase.supabase_project == "abcd1234"
+
+
+def test_parse_cli_args_accepts_update_command() -> None:
+    args = envguard.parse_cli_args(["update"])
+
+    assert args.command == "update"
+
+
+def test_run_update_uses_pipx_force_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(envguard.shutil, "which", lambda name: "/usr/local/bin/pipx")
+
+    def fake_run(cmd: list[str], check: bool) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(envguard.subprocess, "run", fake_run)
+
+    assert envguard.run_update() == 0
+    assert calls == [
+        [
+            "/usr/local/bin/pipx",
+            "install",
+            "--force",
+            "git+https://github.com/Tresnanda/envguard.git",
+        ]
+    ]
 
 
 def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:

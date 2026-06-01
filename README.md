@@ -38,7 +38,7 @@ For unattended installs, pass `--yes`:
 curl -fsSL https://raw.githubusercontent.com/Tresnanda/envguard/main/install.sh | bash -s -- --yes
 ```
 
-The installer uses `pipx`, checks Python and optional Supabase tooling, then offers a simple numbered Supabase token setup. If you paste `SUPABASE_ACCESS_TOKEN` during install, it is saved to your user shell environment, not to project config. The installer then offers to launch `envguard wizard`.
+The installer uses `pipx`, checks Python and optional Supabase tooling, then offers a simple numbered Supabase token setup. If you paste `SUPABASE_ACCESS_TOKEN` during install, it is saved to your user shell environment, not to project config. The installer then offers to launch `envguard wizard`. The wizard checks for a newer GitHub version and asks before updating.
 
 Manual install:
 
@@ -72,6 +72,12 @@ You can also open the guide explicitly:
 
 ```bash
 envguard wizard
+```
+
+Update to the latest GitHub version at any time:
+
+```bash
+envguard update
 ```
 
 Scan another directory:
@@ -109,6 +115,12 @@ Allow advisory findings without failing a workflow:
 ```bash
 envguard --allow-unused
 envguard --allow-missing
+```
+
+By default, terminal output summarizes issue counts without printing long reference tables. Show the full tables when you need file and line details:
+
+```bash
+envguard --details
 ```
 
 Interactively prune unused keys from `.env.example`:
@@ -193,8 +205,8 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 usage: envguard [-h] [--path PATH] [--json] [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--debug] [--exclude PATTERN]
-                [--allow-unused] [--allow-missing] [--no-wizard]
-                [path|wizard|ci|supabase|init] [...]
+                [--allow-unused] [--allow-missing] [--details] [--no-wizard]
+                [path|wizard|ci|supabase|init|update] [...]
 
 options:
   path                  Optional project path, e.g. envguard apps/web.
@@ -202,6 +214,7 @@ options:
   ci [path]             Shortcut for GitHub Actions annotations.
   supabase ID [path]    Shortcut for Supabase secret comparison.
   init [path]           Write or update [tool.envguard] in pyproject.toml.
+  update                Update envguard from GitHub.
   -h, --help            Show help and exit.
   --path PATH           Project path to scan. Defaults to the current directory.
   --json                Print a JSON report.
@@ -212,6 +225,7 @@ options:
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
   --allow-unused        Do not fail on unused keys or orphaned Supabase secrets.
   --allow-missing       Do not fail on missing referenced variables.
+  --details             Show detailed issue tables with file references.
   --no-wizard           Run the default scan instead of the interactive guide.
   --debug               Print detected references and parsed keys.
 ```
