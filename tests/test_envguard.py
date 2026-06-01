@@ -675,6 +675,7 @@ def test_run_update_uses_pipx_force_install(monkeypatch: pytest.MonkeyPatch) -> 
     calls: list[list[str]] = []
 
     monkeypatch.setattr(envguard.shutil, "which", lambda name: "/usr/local/bin/pipx")
+    monkeypatch.setattr(envguard, "_host_python", lambda: "/usr/local/bin/python3.11")
 
     def fake_run(cmd: list[str], check: bool) -> subprocess.CompletedProcess[str]:
         calls.append(cmd)
@@ -687,6 +688,8 @@ def test_run_update_uses_pipx_force_install(monkeypatch: pytest.MonkeyPatch) -> 
         [
             "/usr/local/bin/pipx",
             "install",
+            "--python",
+            "/usr/local/bin/python3.11",
             "--force",
             "git+https://github.com/Tresnanda/envguard.git",
         ]
@@ -698,16 +701,18 @@ def test_run_update_bootstraps_pipx_with_host_python(
 ) -> None:
     calls: list[list[str]] = []
     install_cmd = [
-        "/usr/bin/python3",
+        "/usr/bin/python3.11",
         "-m",
         "pipx",
         "install",
+        "--python",
+        "/usr/bin/python3.11",
         "--force",
         "git+https://github.com/Tresnanda/envguard.git",
     ]
 
     def fake_which(name: str) -> str | None:
-        return "/usr/bin/python3" if name == "python3" else None
+        return "/usr/bin/python3.11" if name == "python3.11" else None
 
     def fake_exists(self: Path) -> bool:
         return False
@@ -718,6 +723,7 @@ def test_run_update_bootstraps_pipx_with_host_python(
             raise subprocess.CalledProcessError(1, cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
+    monkeypatch.setattr(envguard, "_python_version_ok", lambda path: True)
     monkeypatch.setattr(envguard.shutil, "which", fake_which)
     monkeypatch.setattr(envguard.Path, "exists", fake_exists)
     monkeypatch.setattr(envguard.subprocess, "run", fake_run)
@@ -725,8 +731,8 @@ def test_run_update_bootstraps_pipx_with_host_python(
     assert envguard.run_update() == 0
     assert calls == [
         install_cmd,
-        ["/usr/bin/python3", "-m", "pip", "install", "--user", "pipx"],
-        ["/usr/bin/python3", "-m", "pipx", "ensurepath"],
+        ["/usr/bin/python3.11", "-m", "pip", "install", "--user", "pipx"],
+        ["/usr/bin/python3.11", "-m", "pipx", "ensurepath"],
         install_cmd,
     ]
 
