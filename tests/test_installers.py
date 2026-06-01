@@ -63,3 +63,5 @@ def test_ci_opts_into_current_node_runtime_for_actions() -> None:
     text = _read(".github/workflows/ci.yml")
 
     assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in text
+    assert "uses: actions/checkout@v6" in text
+    assert "uses: actions/setup-python@v6" in text
