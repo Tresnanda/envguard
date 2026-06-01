@@ -1385,6 +1385,7 @@ def _rich_output(
 ):
     """Pretty terminal output using rich."""
     console = Console()
+    should_show_details_command = False
 
     # Summary header
     total_refs = sum(len(v) for v in result.references.values())
@@ -1420,8 +1421,7 @@ def _rich_output(
         else:
             label = "key" if len(result.unused) == 1 else "keys"
             console.print(f"[yellow]![/] {len(result.unused)} unused {label} found.")
-            if details_command:
-                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+            should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
     else:
         console.print("[green]✓[/] No unused keys found in configuration.")
@@ -1446,8 +1446,7 @@ def _rich_output(
         else:
             label = "key" if len(result.missing) == 1 else "keys"
             console.print(f"[red]![/] {len(result.missing)} missing {label} detected.")
-            if details_command:
-                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+            should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
     else:
         console.print("[green]✓[/] No missing required keys detected.")
@@ -1477,8 +1476,7 @@ def _rich_output(
                 f"[blue]i[/] {len(result.optional_missing)} optional/defaulted {label} "
                 "absent from config."
             )
-            if details_command:
-                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+            should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
 
     # External/runtime-context keys absent from local config (non-blocking)
@@ -1505,8 +1503,7 @@ def _rich_output(
                 f"[cyan]i[/] {len(result.external_missing)} external/runtime {label} "
                 "absent from local config."
             )
-            if details_command:
-                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+            should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
 
     # Supabase orphans
@@ -1526,8 +1523,11 @@ def _rich_output(
                 f"[magenta]![/] {len(result.supabase_orphans)} orphaned Supabase "
                 f"{label} found."
             )
-            if details_command:
-                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+            should_show_details_command = should_show_details_command or bool(details_command)
+        console.print()
+
+    if should_show_details_command and details_command:
+        console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
 
     # Overall status

@@ -562,6 +562,51 @@ def test_rich_output_hides_missing_reference_table_by_default(capsys) -> None:
     assert "/repo/src/app.py:12" not in out
 
 
+def test_rich_output_prints_details_command_once_for_multiple_issue_types(capsys) -> None:
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file="/repo/src/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ],
+            "OPTIONAL_KEY": [
+                envguard.EnvReference(
+                    key="OPTIONAL_KEY",
+                    file="/repo/src/app.py",
+                    line=13,
+                    pattern_type="os.getenv",
+                )
+            ],
+            "EXTERNAL_KEY": [
+                envguard.EnvReference(
+                    key="EXTERNAL_KEY",
+                    file="/repo/src/app.py",
+                    line=14,
+                    pattern_type="os.getenv",
+                )
+            ],
+        },
+        missing=["MISSING_KEY"],
+        optional_missing=["OPTIONAL_KEY"],
+        external_missing=["EXTERNAL_KEY"],
+    )
+
+    envguard._rich_output(
+        result,
+        dotenv_path=None,
+        supabase_ref=None,
+        details_command="envguard apps/web --details",
+    )
+
+    out = capsys.readouterr().out
+    assert out.count("Show details:") == 1
+    assert out.count("envguard apps/web --details") == 1
+
+
 def test_rich_output_can_show_missing_reference_table(capsys) -> None:
     result = envguard.ScanResult(
         references={
