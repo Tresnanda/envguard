@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -711,7 +712,7 @@ def test_run_update_bootstraps_pipx_with_host_python(
         "git+https://github.com/Tresnanda/envguard.git",
     ]
 
-    def fake_which(name: str) -> str | None:
+    def fake_which(name: str) -> Optional[str]:
         return "/usr/bin/python3.11" if name == "python3.11" else None
 
     def fake_exists(self: Path) -> bool:
