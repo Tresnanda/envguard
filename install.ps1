@@ -4,6 +4,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $AppName = "envguard"
+$RepoSlug = "Tresnanda/envguard"
+$RepoUrl = "https://github.com/$RepoSlug"
 $RepoSpec = "git+https://github.com/Tresnanda/envguard.git"
 
 function Confirm-Step($Prompt, $DefaultYes = $true) {
@@ -12,6 +14,45 @@ function Confirm-Step($Prompt, $DefaultYes = $true) {
     $answer = Read-Host "$Prompt $suffix"
     if ([string]::IsNullOrWhiteSpace($answer)) { return $DefaultYes }
     return @("y", "yes") -contains $answer.ToLowerInvariant()
+}
+
+function Offer-StarRepo {
+    if ($Yes) {
+        Write-Host "Star it here: $RepoUrl"
+        return
+    }
+    if (-not (Confirm-Step "If $AppName helps you, star the GitHub repo now?" $true)) {
+        Write-Host "Star it here: $RepoUrl"
+        return
+    }
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        try {
+            & gh auth status *> $null
+            if ($LASTEXITCODE -eq 0) {
+                & gh repo star $RepoSlug *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "[ok] Starred $RepoUrl"
+                    return
+                }
+            }
+        } catch {}
+    }
+    if ($env:GITHUB_TOKEN) {
+        try {
+            Invoke-RestMethod `
+                -Method Put `
+                -Uri "https://api.github.com/user/starred/$RepoSlug" `
+                -Headers @{
+                    "Accept" = "application/vnd.github+json"
+                    "Authorization" = "Bearer $env:GITHUB_TOKEN"
+                    "X-GitHub-Api-Version" = "2022-11-28"
+                } *> $null
+            Write-Host "[ok] Starred $RepoUrl"
+            return
+        } catch {}
+    }
+    Write-Host "Couldn't auto-star from this terminal."
+    Write-Host "Star it here: $RepoUrl"
 }
 
 function Read-Choice($Prompt, $Default) {
@@ -113,4 +154,5 @@ if (Get-Command $AppName -ErrorAction SilentlyContinue) {
     Write-Host "Run: python -m pipx ensurepath"
 }
 
+Offer-StarRepo
 Write-Host "Run envguard in your terminal to start the guided audit."
