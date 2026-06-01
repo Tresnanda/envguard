@@ -353,6 +353,92 @@ def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     assert result.supabase_orphans == ["LEGACY_SECRET"]
 
 
+def test_detect_references_classifies_optional_defaults_and_embedded_runtime_context(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "harness.mjs"
+    source.write_text(
+        "\n".join(
+            [
+                "const required = process.env.REQUIRED_SECRET;",
+                "const apiId = parseInt(process.env.TELEGRAM_API_ID || '', 10);",
+                "const apiHash = process.env.TELEGRAM_API_HASH || '';",
+                "const model = process.env.DRIVER_MODEL || 'deepseek/deepseek-v4-pro';",
+                "const headless = process.env.PLAYWRIGHT_HEADLESS !== 'false';",
+                "const count = parseInt(process.env.FAN_SIM_PAUSE_MS || '5000', 10);",
+                "const inner = `",
+                (
+                    "const s = createClient(process.env.SUPABASE_URL, "
+                    "process.env.SUPABASE_SERVICE_ROLE_KEY);"
+                ),
+                "`;",
+                "execSync(`cat ${tmp} | ssh host \"docker exec -i app node -\"`);",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = {ref.key: ref for ref in envguard.detect_references(source)}
+
+    assert refs["REQUIRED_SECRET"].requirement == "required"
+    assert refs["TELEGRAM_API_ID"].requirement == "required"
+    assert refs["TELEGRAM_API_HASH"].requirement == "required"
+    assert refs["DRIVER_MODEL"].requirement == "optional"
+    assert refs["PLAYWRIGHT_HEADLESS"].requirement == "optional"
+    assert refs["FAN_SIM_PAUSE_MS"].requirement == "optional"
+    assert refs["SUPABASE_URL"].requirement == "external"
+    assert refs["SUPABASE_SERVICE_ROLE_KEY"].requirement == "external"
+
+
+def test_analyze_only_blocks_required_missing_keys() -> None:
+    ref_map = {
+        "REQUIRED_SECRET": [
+            envguard.EnvReference(
+                key="REQUIRED_SECRET",
+                file="app.mjs",
+                line=1,
+                pattern_type="process.env.KEY",
+                requirement="required",
+            )
+        ],
+        "DRIVER_MODEL": [
+            envguard.EnvReference(
+                key="DRIVER_MODEL",
+                file="app.mjs",
+                line=2,
+                pattern_type="process.env.KEY",
+                requirement="optional",
+            )
+        ],
+        "SUPABASE_URL": [
+            envguard.EnvReference(
+                key="SUPABASE_URL",
+                file="app.mjs",
+                line=3,
+                pattern_type="process.env.KEY",
+                requirement="external",
+            )
+        ],
+    }
+
+    result = envguard.analyze(ref_map=ref_map, dotenv_keys=[])
+
+    assert result.missing == ["REQUIRED_SECRET"]
+    assert result.optional_missing == ["DRIVER_MODEL"]
+    assert result.external_missing == ["SUPABASE_URL"]
+    assert envguard.has_blocking_issues(result, allow_unused=False, allow_missing=False)
+
+    satisfied = envguard.analyze(ref_map=ref_map, dotenv_keys=["REQUIRED_SECRET"])
+    assert satisfied.missing == []
+    assert satisfied.optional_missing == ["DRIVER_MODEL"]
+    assert satisfied.external_missing == ["SUPABASE_URL"]
+    assert not envguard.has_blocking_issues(
+        satisfied,
+        allow_unused=False,
+        allow_missing=False,
+    )
+
+
 def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "\n".join(
@@ -361,6 +447,9 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'dotenv = "config/example.env"',
                 'exclude = ["fixtures/**", "snapshots/**"]',
                 'supabase_project = "abcd1234"',
+                'optional = ["CLI_DEFAULT_BOT"]',
+                'external = ["REMOTE_CONTAINER_SECRET"]',
+                'ignore_missing = ["LEGACY_FLAG"]',
             ]
         ),
         encoding="utf-8",
@@ -371,6 +460,51 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.dotenv == "config/example.env"
     assert config.exclude == ["fixtures/**", "snapshots/**"]
     assert config.supabase_project == "abcd1234"
+    assert config.optional == ["CLI_DEFAULT_BOT"]
+    assert config.external == ["REMOTE_CONTAINER_SECRET"]
+    assert config.ignore_missing == ["LEGACY_FLAG"]
+
+
+def test_analyze_honors_project_level_requirement_overrides() -> None:
+    ref_map = {
+        "CLI_DEFAULT_BOT": [
+            envguard.EnvReference(
+                key="CLI_DEFAULT_BOT",
+                file="cli.mjs",
+                line=1,
+                pattern_type="process.env.KEY",
+            )
+        ],
+        "REMOTE_CONTAINER_SECRET": [
+            envguard.EnvReference(
+                key="REMOTE_CONTAINER_SECRET",
+                file="cli.mjs",
+                line=2,
+                pattern_type="process.env.KEY",
+            )
+        ],
+        "LEGACY_FLAG": [
+            envguard.EnvReference(
+                key="LEGACY_FLAG",
+                file="cli.mjs",
+                line=3,
+                pattern_type="process.env.KEY",
+            )
+        ],
+    }
+
+    result = envguard.analyze(
+        ref_map=ref_map,
+        dotenv_keys=[],
+        optional_keys=["CLI_DEFAULT_BOT"],
+        external_keys=["REMOTE_CONTAINER_SECRET"],
+        ignore_keys=["LEGACY_FLAG"],
+    )
+
+    assert result.missing == []
+    assert result.optional_missing == ["CLI_DEFAULT_BOT"]
+    assert result.external_missing == ["REMOTE_CONTAINER_SECRET"]
+    assert result.ignored_missing == ["LEGACY_FLAG"]
 
 
 def test_github_annotations_include_file_line_and_messages() -> None:

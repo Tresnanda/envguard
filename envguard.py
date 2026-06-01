@@ -60,6 +60,8 @@ class EnvReference:
     file: str
     line: int
     pattern_type: str  # e.g. "os.getenv", "process.env", "$VAR"
+    requirement: str = "required"  # required, optional, or external
+    reason: str = ""
 
 
 @dataclass
@@ -73,7 +75,16 @@ class ScanResult:
     """Keys in .env.example / Supabase but never referenced in code."""
 
     missing: List[str] = field(default_factory=list)
-    """Keys referenced in code but not in .env.example / Supabase."""
+    """Required keys referenced in code but not in .env.example / Supabase."""
+
+    optional_missing: List[str] = field(default_factory=list)
+    """Optional/defaulted keys referenced in code but not in config."""
+
+    external_missing: List[str] = field(default_factory=list)
+    """Keys used in an external/runtime context, not required in local config."""
+
+    ignored_missing: List[str] = field(default_factory=list)
+    """Missing keys intentionally ignored by project configuration."""
 
     supabase_orphans: List[str] = field(default_factory=list)
     """Keys in Supabase secrets but not referenced in code nor .env.example."""
@@ -86,6 +97,9 @@ class EnvguardConfig:
     dotenv: Optional[str] = None
     exclude: List[str] = field(default_factory=list)
     supabase_project: Optional[str] = None
+    optional: List[str] = field(default_factory=list)
+    external: List[str] = field(default_factory=list)
+    ignore_missing: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -303,6 +317,151 @@ def _line_for_offset(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
+def _is_offset_in_raw_js_template(text: str, offset: int) -> bool:
+    """Return True if offset sits in literal text inside a JS template string.
+
+    `${process.env.KEY}` is executable JS and should stay local. A raw
+    `process.env.KEY` inside a backtick-delimited script body is just string
+    content that is often executed in another runtime/container.
+    """
+    in_template = False
+    in_expr = False
+    expr_depth = 0
+    i = 0
+    while i < min(offset, len(text)):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if not in_template:
+            if ch == "`":
+                in_template = True
+            i += 1
+            continue
+
+        if not in_expr:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                in_template = False
+                i += 1
+                continue
+            if ch == "$" and nxt == "{":
+                in_expr = True
+                expr_depth = 1
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if ch in {'"', "'"}:
+            quote = ch
+            i += 1
+            while i < min(offset, len(text)):
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "{":
+            expr_depth += 1
+        elif ch == "}":
+            expr_depth -= 1
+            if expr_depth <= 0:
+                in_expr = False
+        i += 1
+
+    return in_template and not in_expr
+
+
+def _has_inline_default_or_guard(
+    line: str,
+    match_start: int,
+    match_end: int,
+    *,
+    allow_call_default: bool,
+) -> bool:
+    """Detect common inline optional/default idioms around a reference."""
+    tail = line[match_end:]
+    statement_tail = tail.split(";", 1)[0]
+    call_tail = tail.split(")", 1)[0]
+
+    fallback = re.search(r"(?:\|\||\?\?)\s*([^,;)]+)", statement_tail)
+    if fallback:
+        default_value = fallback.group(1).strip()
+        if default_value not in {"''", '""', "``"}:
+            return True
+    if re.match(r"\s*(?:={2,3}|!={1,2})\s*(?:['\"`]|true\b|false\b|0\b|1\b)", tail):
+        return True
+    if allow_call_default and "," in call_tail:
+        return True
+    if re.search(r"\)\s*(?:\|\||\?\?)", statement_tail):
+        return True
+    return False
+
+
+def _classify_reference(
+    pattern_type: str,
+    line: str,
+    match_start: int,
+    match_end: int,
+    match_text: str,
+    full_text: str,
+    absolute_offset: int,
+) -> tuple[str, str]:
+    """Classify whether a reference is required, optional, or external."""
+    if pattern_type.startswith("process.env") and _is_offset_in_raw_js_template(
+        full_text,
+        absolute_offset,
+    ):
+        return "external", "inside JavaScript template string/runtime payload"
+
+    if pattern_type == "${KEY}":
+        if "?" in match_text:
+            return "required", "shell expansion requires value"
+        if re.search(r":?[-=+]", match_text):
+            return "optional", "shell expansion provides a default/alternate"
+
+    call_default_patterns = {
+        "os.getenv",
+        "os.environ.get",
+        "ENV.fetch",
+        "env()",
+    }
+    if pattern_type in {
+        "process.env.KEY",
+        'process.env["KEY"]',
+        "Deno.env.get",
+        "os.getenv",
+        "os.environ.get",
+        "ENV.fetch",
+        "getenv",
+        "env()",
+    } and _has_inline_default_or_guard(
+        line,
+        match_start,
+        match_end,
+        allow_call_default=pattern_type in call_default_patterns,
+    ):
+        return "optional", "inline default or guard"
+
+    return "required", ""
+
+
+def _zod_key_requirement(entry: str) -> tuple[str, str]:
+    if re.search(r"\.(?:optional|nullish)\s*\(", entry) or ".default(" in entry:
+        return "optional", "zod schema marks key optional/defaulted"
+    return "required", ""
+
+
+def _pydantic_field_requirement(line: str) -> tuple[str, str]:
+    if "=" in line:
+        return "optional", "pydantic field has a default"
+    return "required", ""
+
+
 def _add_ref(
     refs: List[EnvReference],
     seen: set[tuple[str, int, str]],
@@ -310,6 +469,8 @@ def _add_ref(
     file_path: Path,
     line: int,
     pattern_type: str,
+    requirement: str = "required",
+    reason: str = "",
 ) -> None:
     identity = (key, line, pattern_type)
     if identity in seen:
@@ -321,6 +482,8 @@ def _add_ref(
             file=str(file_path),
             line=line,
             pattern_type=pattern_type,
+            requirement=requirement,
+            reason=reason,
         )
     )
 
@@ -411,6 +574,11 @@ def _detect_zod_process_env_schema_refs(
         body = schema.group("body")
         for key_match in key_pattern.finditer(body):
             absolute = schema.start("body") + key_match.start(1)
+            entry_end = body.find("\n", key_match.start())
+            if entry_end == -1:
+                entry_end = len(body)
+            entry = body[key_match.start() : entry_end]
+            requirement, reason = _zod_key_requirement(entry)
             _add_ref(
                 refs,
                 seen,
@@ -418,6 +586,8 @@ def _detect_zod_process_env_schema_refs(
                 file_path,
                 _line_for_offset(text, absolute),
                 "zod process.env schema",
+                requirement,
+                reason,
             )
 
 
@@ -448,7 +618,17 @@ def _detect_pydantic_settings_refs(
         field_match = field_pattern.match(line)
         if field_match:
             key = field_match.group("name").upper()
-            _add_ref(refs, seen, key, file_path, lineno, "pydantic BaseSettings")
+            requirement, reason = _pydantic_field_requirement(line)
+            _add_ref(
+                refs,
+                seen,
+                key,
+                file_path,
+                lineno,
+                "pydantic BaseSettings",
+                requirement,
+                reason,
+            )
 
 
 def detect_references(file_path: Path) -> List[EnvReference]:
@@ -463,12 +643,37 @@ def detect_references(file_path: Path) -> List[EnvReference]:
     seen: set[tuple[str, int, str]] = set()
 
     lines = text.splitlines()
+    line_offsets: List[int] = []
+    offset = 0
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line) + 1
+
     for lineno, line in enumerate(lines, start=1):
         for pattern, pname, pattern_scopes in PATTERNS:
             if not (scopes & pattern_scopes):
                 continue
             for match in pattern.finditer(line):
-                _add_ref(refs, seen, match.group(1), file_path, lineno, pname)
+                absolute_offset = line_offsets[lineno - 1] + match.start()
+                requirement, reason = _classify_reference(
+                    pname,
+                    line,
+                    match.start(),
+                    match.end(),
+                    match.group(0),
+                    text,
+                    absolute_offset,
+                )
+                _add_ref(
+                    refs,
+                    seen,
+                    match.group(1),
+                    file_path,
+                    lineno,
+                    pname,
+                    requirement,
+                    reason,
+                )
 
     if "js" in scopes:
         _detect_sveltekit_refs(file_path, text, refs, seen)
@@ -698,13 +903,20 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
     dotenv = raw_config.get("dotenv")
     supabase_project = raw_config.get("supabase_project")
     exclude = raw_config.get("exclude", [])
+    optional = raw_config.get("optional", [])
+    external = raw_config.get("external", [])
+    ignore_missing = raw_config.get("ignore_missing", [])
+
+    def list_of_strings(value: object) -> List[str]:
+        return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
     return EnvguardConfig(
         dotenv=dotenv if isinstance(dotenv, str) else None,
-        exclude=[item for item in exclude if isinstance(item, str)]
-        if isinstance(exclude, list)
-        else [],
+        exclude=list_of_strings(exclude),
         supabase_project=supabase_project if isinstance(supabase_project, str) else None,
+        optional=list_of_strings(optional),
+        external=list_of_strings(external),
+        ignore_missing=list_of_strings(ignore_missing),
     )
 
 
@@ -1111,6 +1323,9 @@ def analyze(
     ref_map: Dict[str, List[EnvReference]],
     dotenv_keys: List[str],
     supabase_keys: Optional[List[str]] = None,
+    optional_keys: Optional[List[str]] = None,
+    external_keys: Optional[List[str]] = None,
+    ignore_keys: Optional[List[str]] = None,
 ) -> ScanResult:
     """Cross-reference code references against expected keys."""
     result = ScanResult(references=ref_map)
@@ -1123,8 +1338,32 @@ def analyze(
     # UNUSED: in .env.example but never referenced in code
     result.unused = sorted(example_keys - code_keys)
 
-    # MISSING: referenced in code but not in .env.example or Supabase secrets
-    result.missing = sorted(code_keys - available_keys)
+    required_key_set: set[str] = set()
+    optional_key_set: set[str] = set(optional_keys or [])
+    external_key_set: set[str] = set(external_keys or [])
+    ignored_key_set: set[str] = set(ignore_keys or [])
+    for key, refs in ref_map.items():
+        if key in ignored_key_set:
+            continue
+        if key in external_key_set:
+            continue
+        if key in optional_key_set:
+            continue
+        requirements = {ref.requirement for ref in refs}
+        if "required" in requirements:
+            required_key_set.add(key)
+        elif "optional" in requirements:
+            optional_key_set.add(key)
+        elif "external" in requirements:
+            external_key_set.add(key)
+        else:
+            required_key_set.add(key)
+
+    # MISSING: required references not available locally/remotely.
+    result.missing = sorted(required_key_set - available_keys)
+    result.optional_missing = sorted(optional_key_set & code_keys - available_keys)
+    result.external_missing = sorted(external_key_set & code_keys - available_keys)
+    result.ignored_missing = sorted(ignored_key_set & code_keys - available_keys)
 
     # If Supabase secrets were provided, find orphans
     if supabase_keys is not None:
@@ -1211,7 +1450,63 @@ def _rich_output(
                 console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
     else:
-        console.print("[green]✓[/] No missing keys detected.")
+        console.print("[green]✓[/] No missing required keys detected.")
+        console.print()
+
+    # Optional/defaulted keys absent from config (non-blocking)
+    if result.optional_missing:
+        if show_details:
+            table = Table(
+                title="[blue]OPTIONAL[/] — Defaulted keys absent from config",
+                border_style="blue",
+            )
+            table.add_column("Key", style="blue", no_wrap=True)
+            table.add_column("References", style="dim")
+            for key in result.optional_missing:
+                refs = result.references.get(key, [])
+                locs = "; ".join(
+                    f"{r.file}:{r.line} ({r.reason or r.requirement})" for r in refs[:3]
+                )
+                if len(refs) > 3:
+                    locs += f" …and {len(refs)-3} more"
+                table.add_row(key, locs)
+            console.print(table)
+        else:
+            label = "key" if len(result.optional_missing) == 1 else "keys"
+            console.print(
+                f"[blue]i[/] {len(result.optional_missing)} optional/defaulted {label} "
+                "absent from config."
+            )
+            if details_command:
+                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
+        console.print()
+
+    # External/runtime-context keys absent from local config (non-blocking)
+    if result.external_missing:
+        if show_details:
+            table = Table(
+                title="[cyan]EXTERNAL[/] — Runtime-context keys absent from local config",
+                border_style="cyan",
+            )
+            table.add_column("Key", style="cyan", no_wrap=True)
+            table.add_column("References", style="dim")
+            for key in result.external_missing:
+                refs = result.references.get(key, [])
+                locs = "; ".join(
+                    f"{r.file}:{r.line} ({r.reason or r.requirement})" for r in refs[:3]
+                )
+                if len(refs) > 3:
+                    locs += f" …and {len(refs)-3} more"
+                table.add_row(key, locs)
+            console.print(table)
+        else:
+            label = "key" if len(result.external_missing) == 1 else "keys"
+            console.print(
+                f"[cyan]i[/] {len(result.external_missing)} external/runtime {label} "
+                "absent from local config."
+            )
+            if details_command:
+                console.print(f"[dim]Show details:[/] [bold]{details_command}[/]")
         console.print()
 
     # Supabase orphans
@@ -1236,11 +1531,15 @@ def _rich_output(
         console.print()
 
     # Overall status
-    if result.unused or result.missing or result.supabase_orphans:
+    blocking_issues = bool(result.unused or result.missing or result.supabase_orphans)
+    advisory_issues = bool(result.optional_missing or result.external_missing)
+    if blocking_issues:
         if show_details:
             console.print("[bold red]✗[/] Issues found. Review the tables above.")
         else:
             console.print("[bold red]✗[/] Issues found.")
+    elif advisory_issues:
+        console.print("[bold green]✓[/] No blocking issues. Advisory items shown above.")
     else:
         console.print("[bold green]✓[/] All environment variables are accounted for!")
 
@@ -1252,10 +1551,19 @@ def _json_output(result: ScanResult):
     output = {
         "unused": result.unused,
         "missing": result.missing,
+        "optional_missing": result.optional_missing,
+        "external_missing": result.external_missing,
+        "ignored_missing": result.ignored_missing,
         "supabase_orphans": result.supabase_orphans,
         "references": {
             key: [
-                {"file": r.file, "line": r.line, "pattern": r.pattern_type}
+                {
+                    "file": r.file,
+                    "line": r.line,
+                    "pattern": r.pattern_type,
+                    "requirement": r.requirement,
+                    "reason": r.reason,
+                }
                 for r in refs
             ]
             for key, refs in result.references.items()
@@ -1298,6 +1606,18 @@ def build_github_annotations(result: ScanResult) -> List[str]:
     for key in result.unused:
         annotations.append(
             f"::warning::Unused environment variable {_escape_annotation_message(key)}"
+        )
+
+    for key in result.optional_missing:
+        annotations.append(
+            f"::notice::Optional environment variable {_escape_annotation_message(key)} "
+            "is absent from config"
+        )
+
+    for key in result.external_missing:
+        annotations.append(
+            f"::notice::External/runtime environment variable "
+            f"{_escape_annotation_message(key)} is absent from local config"
         )
 
     for key in result.supabase_orphans:
@@ -1561,6 +1881,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--optional",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Mark a missing key as optional/defaulted. Can be repeated.",
+    )
+    parser.add_argument(
+        "--external",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Mark a missing key as owned by another runtime/container. Can be repeated.",
+    )
+    parser.add_argument(
+        "--ignore-missing",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Ignore a missing key entirely. Can be repeated.",
+    )
+    parser.add_argument(
         "--allow-unused",
         action="store_true",
         help="Do not fail when unused .env.example keys or Supabase orphan secrets are found",
@@ -1735,7 +2076,14 @@ def main(argv: Optional[List[str]] = None):
             print()
 
     # ── Analyze ────────────────────────────────────────────────────────────
-    result = analyze(ref_map, dotenv_keys, supabase_keys)
+    result = analyze(
+        ref_map,
+        dotenv_keys,
+        supabase_keys,
+        optional_keys=config.optional + args.optional,
+        external_keys=config.external + args.external,
+        ignore_keys=config.ignore_missing + args.ignore_missing,
+    )
 
     # ── Output ─────────────────────────────────────────────────────────────
     if args.github_annotations:

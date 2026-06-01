@@ -8,12 +8,15 @@ Environment-variable audits for Python, JavaScript, shell, and Supabase Edge Fun
 
 Environment variables tend to drift as projects grow. Old keys stay in example files, new keys are added directly to code, and serverless secrets can linger after features are removed. `envguard` gives you a fast local check that is easy to run before deploys or in CI.
 
-It reports three classes of issues:
+It reports six classes of findings:
 
 | Issue | Meaning |
 | --- | --- |
 | `UNUSED` | A key exists in `.env.example` but is not referenced in the scanned code. |
-| `MISSING` | A key is referenced in code but is not present in `.env.example` or fetched Supabase secrets. |
+| `MISSING` | A required key is referenced in code but is not present in `.env.example` or fetched Supabase secrets. This is blocking by default. |
+| `OPTIONAL` | A defaulted/guarded key is absent from config. This is advisory and does not fail CI. |
+| `EXTERNAL` | A key appears to belong to another runtime/container, such as an embedded script executed over SSH. This is advisory and does not fail CI. |
+| `IGNORED` | A missing key was explicitly ignored by project config or CLI flags. |
 | `ORPHANED` | A Supabase secret exists but is not referenced in code or documented in `.env.example`. |
 
 ## Installation
@@ -117,6 +120,14 @@ envguard --allow-unused
 envguard --allow-missing
 ```
 
+Mark known project-specific runtime behavior without hiding other real issues:
+
+```bash
+envguard --optional CONVO_BOT
+envguard --external SUPABASE_SERVICE_ROLE_KEY
+envguard --ignore-missing LEGACY_FLAG
+```
+
 By default, terminal output summarizes issue counts without printing long reference tables. Show the full tables when you need file and line details:
 
 ```bash
@@ -176,9 +187,12 @@ envguard init --dotenv config/example.env --exclude "fixtures/**"
 dotenv = "config/example.env"
 exclude = ["fixtures/**", "docs/examples/**"]
 supabase_project = "your-project-ref"
+optional = ["CLI_DEFAULT_BOT"]
+external = ["REMOTE_CONTAINER_SECRET"]
+ignore_missing = ["LEGACY_FLAG"]
 ```
 
-CLI flags still work on top of this configuration. For example, `--exclude` adds more ignore patterns, and `--supabase-project` overrides the configured project.
+CLI flags still work on top of this configuration. For example, `--exclude` adds more ignore patterns, `--optional` / `--external` / `--ignore-missing` add per-run requirement overrides, and `--supabase-project` overrides the configured project.
 
 ## Supported Reference Patterns
 
@@ -204,8 +218,9 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 ```text
 usage: envguard [-h] [--path PATH] [--json] [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
-                [--dotenv DOTENV] [--debug] [--exclude PATTERN]
-                [--allow-unused] [--allow-missing] [--details] [--no-wizard]
+                [--dotenv DOTENV] [--debug] [--details] [--exclude PATTERN]
+                [--optional KEY] [--external KEY] [--ignore-missing KEY]
+                [--allow-unused] [--allow-missing] [--no-wizard]
                 [path|wizard|ci|supabase|init|update] [...]
 
 options:
@@ -223,6 +238,9 @@ options:
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
   --dotenv PATH         Path to dotenv example file. Defaults to <path>/.env.example.
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
+  --optional KEY        Mark a missing key as optional/defaulted. Can be repeated.
+  --external KEY        Mark a missing key as owned by another runtime/container. Can be repeated.
+  --ignore-missing KEY  Ignore a missing key entirely. Can be repeated.
   --allow-unused        Do not fail on unused keys or orphaned Supabase secrets.
   --allow-missing       Do not fail on missing referenced variables.
   --details             Show detailed issue tables with file references.
@@ -236,13 +254,18 @@ options:
 {
   "unused": ["OLD_API_KEY"],
   "missing": ["NEW_SECRET"],
+  "optional_missing": ["LOCAL_TIMEOUT_MS"],
+  "external_missing": ["REMOTE_CONTAINER_SECRET"],
+  "ignored_missing": ["LEGACY_FLAG"],
   "supabase_orphans": ["LEGACY_EDGE_SECRET"],
   "references": {
     "DATABASE_URL": [
       {
         "file": "/path/to/app.py",
         "line": 12,
-        "pattern": "os.getenv"
+        "pattern": "os.getenv",
+        "requirement": "required",
+        "reason": ""
       }
     ]
   }
@@ -253,10 +276,10 @@ options:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | No unused, missing, or orphaned keys were found. |
-| `1` | The audit found issues or could not complete. |
+| `0` | No blocking findings were found. Advisory optional/external/ignored findings may still be present. |
+| `1` | The audit found blocking issues or could not complete. |
 
-`--allow-unused` suppresses failure for unused `.env.example` keys and orphaned Supabase secrets. `--allow-missing` suppresses failure for missing referenced keys. The findings still appear in the selected output format.
+`--allow-unused` suppresses failure for unused `.env.example` keys and orphaned Supabase secrets. `--allow-missing` suppresses failure for required missing referenced keys. Optional, external, and ignored missing keys are advisory by default and still appear in the selected output format.
 
 ## Development
 
