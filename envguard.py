@@ -82,32 +82,355 @@ class EnvguardConfig:
 # ─── Detection Patterns ────────────────────────────────────────────────────
 
 
-# Each pattern is a (regex, pattern_name) tuple.
+# Each pattern is a (regex, pattern_name, language_scopes) tuple.
 # The regex must have exactly one capture group for the env var name.
-PATTERNS: List[Tuple[re.Pattern, str]] = [
+#
+# IMPORTANT: Do not run shell-style $KEY/${KEY}/%KEY% regexes over every file.
+# Modern codebases use the same syntax for JS template literals, TS properties,
+# Python strftime, Flutter/iOS build files, and generated bundles. Scopes keep
+# each pattern constrained to file types where it means "environment variable".
+PATTERNS: List[Tuple[re.Pattern, str, frozenset[str]]] = [
     # Python
-    (re.compile(r'os\.getenv\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'), "os.getenv"),
-    (re.compile(r'os\.environ\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'), "os.environ[]"),
-    (re.compile(r'os\.environ\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'), "os.environ.get"),
-    (re.compile(r'os\.getenv\b'), None),  # skip, already caught by specific
-    # Node/JS
-    (re.compile(r'process\.env\.([A-Za-z_][A-Za-z0-9_]*)'), "process.env.KEY"),
-    (re.compile(r'process\.env\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'), 'process.env["KEY"]'),
-    # Deno/Edge
-    (re.compile(r'Deno\.env\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'), "Deno.env.get"),
-    # Shell
-    (re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}'), "${KEY}"),
-    (re.compile(r'(?<!\$)\$([A-Za-z_][A-Za-z0-9_]+)(?![A-Za-z0-9_])'), "$KEY"),
-    # Generic
     (
-        re.compile(
-            r'(?<![A-Za-z0-9_])env\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']',
-            re.IGNORECASE,
-        ),
-        "env()",
+        re.compile(r'os\.getenv\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "os.getenv",
+        frozenset({"python"}),
     ),
-    (re.compile(r'%([A-Za-z_][A-Za-z0-9_]*)%'), "%KEY%"),
+    (
+        re.compile(r'os\.environ\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "os.environ[]",
+        frozenset({"python"}),
+    ),
+    (
+        re.compile(r'os\.environ\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "os.environ.get",
+        frozenset({"python"}),
+    ),
+    # Node/JS/TS/Deno
+    (
+        re.compile(r'process\.env\.([A-Za-z_][A-Za-z0-9_]*)'),
+        "process.env.KEY",
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'process\.env\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        'process.env["KEY"]',
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)'),
+        "import.meta.env.KEY",
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'import\.meta\.env\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        'import.meta.env["KEY"]',
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'Deno\.env\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "Deno.env.get",
+        frozenset({"js"}),
+    ),
+    # Ruby
+    (
+        re.compile(r'ENV\.fetch\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "ENV.fetch",
+        frozenset({"ruby"}),
+    ),
+    (
+        re.compile(r'ENV\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "ENV[]",
+        frozenset({"ruby"}),
+    ),
+    # Go
+    (
+        re.compile(r'os\.Getenv\s*\(\s*["`]([A-Za-z_][A-Za-z0-9_]*)["`]'),
+        "os.Getenv",
+        frozenset({"go"}),
+    ),
+    (
+        re.compile(r'os\.LookupEnv\s*\(\s*["`]([A-Za-z_][A-Za-z0-9_]*)["`]'),
+        "os.LookupEnv",
+        frozenset({"go"}),
+    ),
+    # Rust
+    (
+        re.compile(r'(?:std::)?env::var(?:_os)?\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "std::env::var",
+        frozenset({"rust"}),
+    ),
+    # PHP / Laravel
+    (
+        re.compile(r'getenv\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "getenv",
+        frozenset({"php"}),
+    ),
+    (
+        re.compile(r'\$_(?:ENV|SERVER)\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "$_ENV[]",
+        frozenset({"php"}),
+    ),
+    (
+        re.compile(r'(?<![A-Za-z0-9_])env\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "env()",
+        frozenset({"php"}),
+    ),
+    # JVM
+    (
+        re.compile(r'System\.getenv\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "System.getenv",
+        frozenset({"jvm"}),
+    ),
+    (
+        re.compile(r'System\.getenv\s*\(\s*\)\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        "System.getenv().get",
+        frozenset({"jvm"}),
+    ),
+    # GitHub Actions expression syntax. Keep separate from shell ${KEY} so
+    # ${{ secrets.KEY }} does not become a bogus shell reference.
+    (
+        re.compile(r'\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}'),
+        "github-actions secrets.KEY",
+        frozenset({"github_actions"}),
+    ),
+    (
+        re.compile(r'\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}'),
+        "github-actions env.KEY",
+        frozenset({"github_actions"}),
+    ),
+    # Shell / Docker Compose. Supports ${KEY}, ${KEY:-default}, ${KEY?err}, etc.
+    (
+        re.compile(r'\$\{(?!\{)\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s*(?::?[-=?+])[^}]*)?\}'),
+        "${KEY}",
+        frozenset({"shell"}),
+    ),
+    (
+        re.compile(r'(?<![\w$])\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])'),
+        "$KEY",
+        frozenset({"shell"}),
+    ),
+    # Windows batch syntax. Never apply to Python/JS/etc.; it conflicts with strftime.
+    (
+        re.compile(r'%([A-Za-z_][A-Za-z0-9_]*)%'),
+        "%KEY%",
+        frozenset({"windows_batch"}),
+    ),
 ]
+
+JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
+PYTHON_SUFFIXES = {".py", ".pyw"}
+SHELL_SUFFIXES = {".sh", ".bash", ".zsh", ".ksh", ".envrc"}
+RUBY_SUFFIXES = {".rb", ".rake"}
+GO_SUFFIXES = {".go"}
+RUST_SUFFIXES = {".rs"}
+PHP_SUFFIXES = {".php"}
+JVM_SUFFIXES = {".java", ".kt", ".kts", ".scala", ".groovy"}
+WINDOWS_BATCH_SUFFIXES = {".bat", ".cmd"}
+
+
+def _pattern_scopes_for_path(file_path: Path) -> set[str]:
+    """Return scanner scopes that are semantically valid for this file."""
+    suffix = file_path.suffix.lower()
+    name = file_path.name.lower()
+    scopes: set[str] = set()
+
+    if suffix in PYTHON_SUFFIXES:
+        scopes.add("python")
+    if suffix in JS_SUFFIXES:
+        scopes.add("js")
+    if suffix in RUBY_SUFFIXES or name in {"gemfile", "rakefile"}:
+        scopes.add("ruby")
+    if suffix in GO_SUFFIXES:
+        scopes.add("go")
+    if suffix in RUST_SUFFIXES:
+        scopes.add("rust")
+    if suffix in PHP_SUFFIXES:
+        scopes.add("php")
+    if suffix in JVM_SUFFIXES:
+        scopes.add("jvm")
+    if suffix in SHELL_SUFFIXES or name in {"dockerfile", "makefile", "gnumakefile"}:
+        scopes.add("shell")
+    if suffix in WINDOWS_BATCH_SUFFIXES:
+        scopes.add("windows_batch")
+    if _is_docker_compose_file(file_path):
+        scopes.add("shell")
+    if _is_github_actions_workflow(file_path):
+        scopes.add("github_actions")
+        scopes.add("shell")
+
+    return scopes
+
+
+def _is_github_actions_workflow(file_path: Path) -> bool:
+    parts = {part.lower() for part in file_path.parts}
+    return (
+        ".github" in parts
+        and "workflows" in parts
+        and file_path.suffix.lower() in {".yml", ".yaml"}
+    )
+
+
+def _is_docker_compose_file(file_path: Path) -> bool:
+    name = file_path.name.lower()
+    return name in {
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    } or name.startswith("docker-compose.") and name.endswith((".yml", ".yaml"))
+
+
+def _line_for_offset(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _add_ref(
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+    key: str,
+    file_path: Path,
+    line: int,
+    pattern_type: str,
+) -> None:
+    identity = (key, line, pattern_type)
+    if identity in seen:
+        return
+    seen.add(identity)
+    refs.append(
+        EnvReference(
+            key=key,
+            file=str(file_path),
+            line=line,
+            pattern_type=pattern_type,
+        )
+    )
+
+
+def _detect_sveltekit_refs(
+    file_path: Path,
+    text: str,
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+) -> None:
+    """Detect SvelteKit $env/static imports and $env/dynamic env.KEY usage."""
+    if "$env/" not in text:
+        return
+
+    static_import = re.compile(
+        r'import\s*\{(?P<names>[^}]+)\}\s*from\s*["\']\$env/static/(?:private|public)["\']',
+        re.MULTILINE | re.DOTALL,
+    )
+    for match in static_import.finditer(text):
+        line = _line_for_offset(text, match.start())
+        for item in match.group("names").split(","):
+            name = item.strip().split(" as ", 1)[0].strip()
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                _add_ref(refs, seen, name, file_path, line, "$env/static import")
+
+    dynamic_aliases: set[str] = set()
+    dynamic_import = re.compile(
+        r'import\s*\{(?P<names>[^}]+)\}\s*from\s*["\']\$env/dynamic/(?:private|public)["\']',
+        re.MULTILINE | re.DOTALL,
+    )
+    for match in dynamic_import.finditer(text):
+        for item in match.group("names").split(","):
+            item = item.strip()
+            alias_match = re.fullmatch(r'env\s+as\s+([A-Za-z_][A-Za-z0-9_]*)', item)
+            if item == "env":
+                dynamic_aliases.add("env")
+            elif alias_match:
+                dynamic_aliases.add(alias_match.group(1))
+
+    for alias in dynamic_aliases:
+        alias_pattern = re.compile(rf'\b{re.escape(alias)}\.([A-Za-z_][A-Za-z0-9_]*)')
+        for match in alias_pattern.finditer(text):
+            _add_ref(
+                refs,
+                seen,
+                match.group(1),
+                file_path,
+                _line_for_offset(text, match.start()),
+                "$env/dynamic.KEY",
+            )
+
+
+def _detect_zod_process_env_schema_refs(
+    file_path: Path,
+    text: str,
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+) -> None:
+    """Treat ALL_CAPS z.object schema keys parsed from process.env as env refs."""
+    if "z.object" not in text:
+        return
+
+    env_inputs = {"process.env"}
+    for match in re.finditer(
+        r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:NodeJS\.)?ProcessEnv\b',
+        text,
+    ):
+        env_inputs.add(match.group("name"))
+
+    env_schema_names: set[str] = set()
+    parse_pattern = re.compile(
+        r'(?P<schema>[A-Za-z_][A-Za-z0-9_]*)\.(?:safeParse|parse)\s*\(\s*'
+        r'(?P<input>process\.env|[A-Za-z_][A-Za-z0-9_]*)\s*\)'
+    )
+    for match in parse_pattern.finditer(text):
+        if match.group("input") in env_inputs:
+            env_schema_names.add(match.group("schema"))
+
+    schema_pattern = re.compile(
+        r'(?:const|let|var)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*'
+        r'z\.object\s*\(\s*\{(?P<body>.*?)\}\s*\)',
+        re.DOTALL,
+    )
+    key_pattern = re.compile(r'(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]*)\s*:')
+    for schema in schema_pattern.finditer(text):
+        if schema.group("name") not in env_schema_names:
+            continue
+        body = schema.group("body")
+        for key_match in key_pattern.finditer(body):
+            absolute = schema.start("body") + key_match.start(1)
+            _add_ref(
+                refs,
+                seen,
+                key_match.group(1),
+                file_path,
+                _line_for_offset(text, absolute),
+                "zod process.env schema",
+            )
+
+
+def _detect_pydantic_settings_refs(
+    file_path: Path,
+    text: str,
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+) -> None:
+    """Map Pydantic BaseSettings fields to their default uppercase env names."""
+    if "BaseSettings" not in text:
+        return
+
+    in_settings_class = False
+    class_indent = 0
+    field_pattern = re.compile(r'^(?P<indent>\s+)(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:')
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        class_match = re.match(r'^(?P<indent>\s*)class\s+\w+\([^)]*BaseSettings[^)]*\)\s*:', line)
+        if class_match:
+            in_settings_class = True
+            class_indent = len(class_match.group("indent"))
+            continue
+        if not in_settings_class:
+            continue
+        if line.strip() and len(line) - len(line.lstrip()) <= class_indent:
+            in_settings_class = False
+            continue
+        field_match = field_pattern.match(line)
+        if field_match:
+            key = field_match.group("name").upper()
+            _add_ref(refs, seen, key, file_path, lineno, "pydantic BaseSettings")
 
 
 def detect_references(file_path: Path) -> List[EnvReference]:
@@ -118,21 +441,23 @@ def detect_references(file_path: Path) -> List[EnvReference]:
     except (OSError, UnicodeDecodeError):
         return refs
 
+    scopes = _pattern_scopes_for_path(file_path)
+    seen: set[tuple[str, int, str]] = set()
+
     lines = text.splitlines()
     for lineno, line in enumerate(lines, start=1):
-        for pattern, pname in PATTERNS:
-            if pname is None:
+        for pattern, pname, pattern_scopes in PATTERNS:
+            if not (scopes & pattern_scopes):
                 continue
             for match in pattern.finditer(line):
-                key = match.group(1)
-                refs.append(
-                    EnvReference(
-                        key=key,
-                        file=str(file_path),
-                        line=lineno,
-                        pattern_type=pname,
-                    )
-                )
+                _add_ref(refs, seen, match.group(1), file_path, lineno, pname)
+
+    if "js" in scopes:
+        _detect_sveltekit_refs(file_path, text, refs, seen)
+        _detect_zod_process_env_schema_refs(file_path, text, refs, seen)
+    if "python" in scopes:
+        _detect_pydantic_settings_refs(file_path, text, refs, seen)
+
     return refs
 
 
@@ -182,6 +507,21 @@ def should_skip(path: Path, exclude_patterns: Optional[List[str]] = None) -> boo
         ".ruff_cache",
         ".mypy_cache",
         ".pytest_cache",
+        ".dart_tool",
+        ".expo",
+        ".turbo",
+        ".svelte-kit",
+        ".angular",
+        ".vite",
+        ".parcel-cache",
+        ".codex",
+        "Pods",
+        "DerivedData",
+        "docs",
+        "generated",
+        ".generated",
+        "__generated__",
+        "codegen",
     }
     skip_extensions = {
         ".pyc",
@@ -224,6 +564,18 @@ def should_skip(path: Path, exclude_patterns: Optional[List[str]] = None) -> boo
         ".wav",
         ".ogg",
         ".flac",
+        ".map",
+        ".log",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".pbxproj",
+        ".xcconfig",
+        ".xcfilelist",
+        ".xcscheme",
+        ".iml",
+        ".ps1",
     }
 
     # Skip hidden dirs and common vendored dirs
@@ -269,6 +621,8 @@ def scan_directory(
             continue
         if not _is_text_file(file_path):
             continue
+        if _looks_generated_or_minified(file_path):
+            continue
 
         refs = detect_references(file_path)
         for ref in refs:
@@ -284,6 +638,24 @@ def _is_text_file(path: Path) -> bool:
         return b"\x00" not in chunk
     except OSError:
         return False
+
+
+def _looks_generated_or_minified(path: Path) -> bool:
+    """Skip giant/minified generated text bundles that create regex noise."""
+    try:
+        sample = path.read_text(encoding="utf-8", errors="replace")[:32768]
+        size = path.stat().st_size
+    except OSError:
+        return False
+
+    if size < 10_000 or not sample:
+        return False
+
+    lines = sample.splitlines() or [sample]
+    average_line_length = sum(len(line) for line in lines) / max(len(lines), 1)
+    very_long_lines = sum(1 for line in lines if len(line) > 1000)
+
+    return average_line_length > 500 or very_long_lines >= 3
 
 
 # ─── Project configuration ─────────────────────────────────────────────────

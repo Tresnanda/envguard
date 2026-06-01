@@ -70,6 +70,218 @@ def test_detect_references_finds_common_environment_patterns(tmp_path: Path) -> 
     }
 
 
+
+def test_detect_references_ignores_js_interpolation_and_dollar_properties(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "app.tsx"
+    source.write_text(
+        "\n".join(
+            [
+                "const real = process.env.REAL_ENV;",
+                'const url = `/api/${path}/${userId}`;',
+                "const obj = { $client: { id: 1 } };",
+                "console.log(obj.$client, url, real);",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.pattern_type) for ref in refs} == {
+        ("REAL_ENV", "process.env.KEY")
+    }
+
+
+def test_detect_references_finds_modern_js_framework_env_patterns(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "config.ts"
+    source.write_text(
+        "\n".join(
+            [
+                "import {",
+                "  PRIVATE_API_KEY,",
+                "  PUBLIC_BASE_URL as baseUrl,",
+                "} from '$env/static/private';",
+                "import { env as privateEnv } from '$env/dynamic/private';",
+                "const vite = import.meta.env.VITE_API_URL;",
+                "const secret = import.meta.env['SERVER_SECRET'];",
+                "const dynamic = privateEnv.RUNTIME_SECRET;",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.pattern_type) for ref in refs} == {
+        ("PRIVATE_API_KEY", "$env/static import"),
+        ("PUBLIC_BASE_URL", "$env/static import"),
+        ("VITE_API_URL", "import.meta.env.KEY"),
+        ("SERVER_SECRET", 'import.meta.env["KEY"]'),
+        ("RUNTIME_SECRET", "$env/dynamic.KEY"),
+    }
+
+
+def test_detect_references_finds_zod_process_env_schema_keys(tmp_path: Path) -> None:
+    source = tmp_path / "config.ts"
+    source.write_text(
+        "\n".join(
+            [
+                'import { z } from "zod";',
+                "const envSchema = z.object({",
+                "  NODE_ENV: z.string(),",
+                "  PORT: z.coerce.number(),",
+                "  DATABASE_URL: z.string(),",
+                "  API_KEY: z.string().optional(),",
+                "});",
+                "export function loadConfig(rawEnv: NodeJS.ProcessEnv) {",
+                "  return envSchema.parse(rawEnv);",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {ref.key for ref in refs} == {"NODE_ENV", "PORT", "DATABASE_URL", "API_KEY"}
+    assert {ref.pattern_type for ref in refs} == {"zod process.env schema"}
+
+
+
+
+def test_zod_process_env_schema_detection_ignores_unrelated_schemas(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "config.ts"
+    source.write_text(
+        "\n".join(
+            [
+                'import { z } from "zod";',
+                "const userSchema = z.object({",
+                "  USER_ID: z.string(),",
+                "  USER_NAME: z.string(),",
+                "});",
+                "const envSchema = z.object({",
+                "  DATABASE_URL: z.string(),",
+                "  API_KEY: z.string(),",
+                "});",
+                "export function loadConfig(rawEnv: NodeJS.ProcessEnv) {",
+                "  return envSchema.safeParse(rawEnv);",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {ref.key for ref in refs} == {"DATABASE_URL", "API_KEY"}
+
+
+def test_detect_references_finds_multilanguage_env_apis(tmp_path: Path) -> None:
+    cases = {
+        "app.rb": (
+            'db = ENV.fetch("DATABASE_URL")\nenv = ENV["RAILS_ENV"]\n',
+            {"DATABASE_URL", "RAILS_ENV"},
+        ),
+        "main.go": (
+            'package main\nimport "os"\n'
+            'func main(){ _ = os.Getenv("DATABASE_URL"); _ = os.LookupEnv("PORT") }\n',
+            {"DATABASE_URL", "PORT"},
+        ),
+        "main.rs": (
+            'fn main(){ let _ = std::env::var("DATABASE_URL"); '
+            'let _ = std::env::var_os("RUST_LOG"); }\n',
+            {"DATABASE_URL", "RUST_LOG"},
+        ),
+        "index.php": (
+            '<?php $env = getenv("APP_ENV"); $db = $_ENV["DATABASE_URL"]; ?>\n',
+            {"APP_ENV", "DATABASE_URL"},
+        ),
+        "App.java": (
+            'class App { void run(){ System.getenv("JAVA_ENV"); '
+            'System.getenv().get("DATABASE_URL"); } }\n',
+            {"JAVA_ENV", "DATABASE_URL"},
+        ),
+    }
+
+    for filename, (content, expected) in cases.items():
+        source = tmp_path / filename
+        source.write_text(content, encoding="utf-8")
+
+        refs = envguard.detect_references(source)
+
+        assert {ref.key for ref in refs} == expected
+
+
+def test_shell_scanner_handles_defaults_but_does_not_scan_github_actions_secrets(
+    tmp_path: Path,
+) -> None:
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        "\n".join(
+            [
+                "services:",
+                "  db:",
+                "    environment:",
+                "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev}",
+                "      REDIS_URL: ${REDIS_URL}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    workflow = tmp_path / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        "\n".join(
+            [
+                "env:",
+                "  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}",
+                "jobs:",
+                "  deploy:",
+                "    steps:",
+                "      - run: echo \"$DEPLOY_TOKEN ${API_URL}\"",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    compose_refs = envguard.detect_references(compose)
+    workflow_refs = envguard.detect_references(workflow)
+
+    assert {ref.key for ref in compose_refs} == {"POSTGRES_PASSWORD", "REDIS_URL"}
+    assert {(ref.key, ref.pattern_type) for ref in workflow_refs} == {
+        ("NPM_TOKEN", "github-actions secrets.KEY"),
+        ("DEPLOY_TOKEN", "$KEY"),
+        ("API_URL", "${KEY}"),
+    }
+
+
+def test_scan_directory_skips_generated_mobile_and_bundle_noise(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.ts").write_text(
+        "const value = process.env.APP_SECRET;\n",
+        encoding="utf-8",
+    )
+    generated_files = [
+        tmp_path / ".expo" / "dev" / "logs" / "start.log",
+        tmp_path / "ios" / "Pods" / "Headers" / "Generated.hpp",
+        tmp_path / "assets" / "codemirror" / "cm.bundle.js.txt",
+        tmp_path / "docs" / "plan.md",
+    ]
+    for generated in generated_files:
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("`${fake}` $noise %MORE_NOISE%\n", encoding="utf-8")
+
+    refs = envguard.scan_directory(tmp_path)
+
+    assert set(refs) == {"APP_SECRET"}
+
+
 def test_scan_directory_skips_virtualenv_and_cache_files(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text(
