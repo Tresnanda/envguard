@@ -83,6 +83,31 @@ Update to the latest GitHub version at any time:
 envguard update
 ```
 
+## Agent Skill
+
+`envguard` includes an optional agent skill for Codex and other agents that use
+the open Skills CLI. The skill teaches agents to run envguard before changing
+environment files, deployment config, Supabase Edge Functions, or CI secrets,
+and to report findings without exposing secret values.
+
+Install the skill:
+
+```bash
+npx skills add Tresnanda/envguard --skill envguard
+```
+
+Install globally for all projects:
+
+```bash
+npx skills add Tresnanda/envguard --skill envguard -g
+```
+
+List the skill without installing:
+
+```bash
+npx skills add Tresnanda/envguard -l
+```
+
 Scan another directory:
 
 ```bash
