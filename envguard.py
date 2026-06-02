@@ -1708,6 +1708,52 @@ def _json_output(
     print(json.dumps(output, indent=2))
 
 
+def _count_phrase(count: int, label: str) -> str:
+    """Return a compact count phrase for summary output."""
+    return f"{count} {label}"
+
+
+def format_summary_line(
+    result: ScanResult,
+    allow_unused: bool = False,
+    allow_missing: bool = False,
+) -> str:
+    """Return a one-line terminal summary for CI/chat consumers."""
+    blocking = has_blocking_issues(
+        result,
+        allow_unused=allow_unused,
+        allow_missing=allow_missing,
+    )
+    exit_code = 1 if blocking else 0
+    counts = [
+        (len(result.missing), "missing"),
+        (len(result.unused), "unused"),
+        (len(result.optional_missing), "optional"),
+        (len(result.external_missing), "external"),
+        (len(result.ignored_missing), "ignored"),
+        (len(result.supabase_orphans), "orphaned"),
+    ]
+    shown_counts = [_count_phrase(count, label) for count, label in counts if count]
+    counts_text = ", ".join(shown_counts) if shown_counts else "clean"
+    status = "red" if blocking else "yellow" if shown_counts else "green"
+    return f"envguard: {status} — {counts_text} (exit {exit_code})"
+
+
+def _summary_output(
+    result: ScanResult,
+    allow_unused: bool = False,
+    allow_missing: bool = False,
+) -> None:
+    """Print compact, non-rich terminal output."""
+    print(
+        format_summary_line(
+            result,
+            allow_unused=allow_unused,
+            allow_missing=allow_missing,
+        )
+    )
+
+
 def _escape_annotation_message(value: str) -> str:
     """Escape a value for GitHub Actions workflow command output."""
     return (
@@ -2139,6 +2185,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard init                      Write [tool.envguard] defaults\n"
             "  envguard update                    Update envguard from GitHub\n"
             "  envguard --json                    Machine-readable output\n"
+            "  envguard --summary                 One-line terminal summary\n"
             "  envguard --details                 Show detailed issue tables\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
@@ -2159,6 +2206,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Output in JSON format (machine-readable)",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Output one compact terminal summary line",
     )
     parser.add_argument(
         "--github-annotations",
@@ -2425,6 +2477,12 @@ def main(argv: Optional[List[str]] = None):
         _github_annotations_output(result)
     elif args.json:
         _json_output(
+            result,
+            allow_unused=args.allow_unused,
+            allow_missing=args.allow_missing,
+        )
+    elif args.summary:
+        _summary_output(
             result,
             allow_unused=args.allow_unused,
             allow_missing=args.allow_missing,

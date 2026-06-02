@@ -842,6 +842,40 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
+    result = envguard.ScanResult(
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+        optional_missing=["OPTIONAL_KEY"],
+        external_missing=["EXTERNAL_KEY"],
+        ignored_missing=["IGNORED_KEY"],
+        supabase_orphans=["LEGACY_SECRET"],
+    )
+
+    envguard._summary_output(result)
+
+    assert capsys.readouterr().out == (
+        "envguard: red — 1 missing, 1 unused, 1 optional, 1 external, "
+        "1 ignored, 1 orphaned (exit 1)\n"
+    )
+
+
+def test_summary_output_reflects_allow_flags_and_clean_status() -> None:
+    allowed = envguard.ScanResult(
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+    )
+
+    assert envguard.format_summary_line(
+        allowed,
+        allow_unused=True,
+        allow_missing=True,
+    ) == "envguard: yellow — 1 missing, 1 unused (exit 0)"
+    assert envguard.format_summary_line(envguard.ScanResult()) == (
+        "envguard: green — clean (exit 0)"
+    )
+
+
 def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     positional = envguard.parse_cli_args(["apps/web"])
     assert positional.path == "apps/web"
@@ -852,6 +886,10 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
 
     supabase = envguard.parse_cli_args(["supabase", "abcd1234"])
     assert supabase.supabase_project == "abcd1234"
+
+    summary = envguard.parse_cli_args(["--summary", "apps/web"])
+    assert summary.summary is True
+    assert summary.path == "apps/web"
 
 
 def test_parse_cli_args_accepts_update_command() -> None:
