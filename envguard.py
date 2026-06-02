@@ -1830,6 +1830,16 @@ def interactive_fix(
         )
         return
 
+    if not dry_run and dotenv_path.is_symlink():
+        print(
+            "Refusing to prune a symlinked dotenv file: "
+            f"{dotenv_path}\n"
+            "Use --fix-dry-run to preview removals, then edit the target file "
+            "manually if needed.",
+            file=sys.stderr,
+        )
+        return
+
     console = Console()
 
     # Filter dotenv lines to keep

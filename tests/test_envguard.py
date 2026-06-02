@@ -1181,3 +1181,24 @@ def test_interactive_fix_backup_does_not_follow_existing_symlink(
     assert not malicious_target.exists()
     assert (tmp_path / ".env.example.bak").is_symlink()
     assert (tmp_path / ".env.example.bak.1").read_text(encoding="utf-8") == original
+
+
+def test_interactive_fix_does_not_follow_dotenv_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "real-env-target"
+    original = "OLD_SECRET=real\nKEEP_ME=1\n"
+    target.write_text(original, encoding="utf-8")
+    dotenv = tmp_path / ".env.example"
+    dotenv.symlink_to(target)
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env.example.bak").exists()
+    assert "Refusing to prune a symlinked dotenv file" in capsys.readouterr().err
