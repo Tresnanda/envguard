@@ -346,6 +346,115 @@ def test_scan_directory_honors_user_exclude_globs(tmp_path: Path) -> None:
     assert set(refs) == {"APP_SECRET"}
 
 
+def _mock_supabase_secrets_response(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    status: int = 200,
+) -> None:
+    import http.client
+
+    body_text = payload if isinstance(payload, str) else json.dumps(payload)
+
+    response_status = status
+
+    class FakeResponse:
+        status = response_status
+
+        def read(self) -> bytes:
+            return body_text.encode("utf-8")
+
+    class FakeConnection:
+        def __init__(self, netloc: str, timeout: int) -> None:
+            self.netloc = netloc
+            self.timeout = timeout
+            self.closed = False
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            body: Optional[str] = None,
+            headers: Optional[dict[str, str]] = None,
+        ) -> None:
+            self.method = method
+            self.path = path
+            self.body = body
+            self.headers = headers
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", FakeConnection)
+
+
+def test_fetch_supabase_secrets_ignores_malformed_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        [
+            {"name": "API_KEY"},
+            {"value": "missing name"},
+            {"name": 123},
+            ["not", "an", "object"],
+            "not an object",
+            {"name": "EDGE_SECRET"},
+        ],
+    )
+
+    assert envguard.fetch_supabase_secrets("project-ref", "token") == [
+        "API_KEY",
+        "EDGE_SECRET",
+    ]
+
+
+def test_fetch_supabase_secrets_accepts_secrets_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {"secrets": [{"name": "FIRST_SECRET"}, {"name": None}, {"name": "SECOND_SECRET"}]},
+    )
+
+    assert envguard.fetch_supabase_secrets("project-ref", "token") == [
+        "FIRST_SECRET",
+        "SECOND_SECRET",
+    ]
+
+
+def test_fetch_supabase_secrets_reports_unexpected_top_level_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mock_supabase_secrets_response(monkeypatch, {"data": []})
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", "token")
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Failed to fetch Supabase secrets" in err
+    assert "expected a list or an object with a 'secrets' list" in err
+
+
+def test_fetch_supabase_secrets_reports_invalid_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mock_supabase_secrets_response(monkeypatch, "{not json")
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", "token")
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Failed to fetch Supabase secrets" in err
+    assert "Expecting property name enclosed in double quotes" in err
+
+
 def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     ref_map = {
         "DATABASE_URL": [

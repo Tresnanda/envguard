@@ -1310,6 +1310,34 @@ def parse_dotenv_example(path: Path) -> List[str]:
 SUPABASE_API_BASE = "https://api.supabase.com"
 
 
+def _parse_supabase_secret_names(data: object) -> List[str]:
+    """Extract Supabase secret names from supported API response shapes."""
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        secrets = data.get("secrets")
+        if not isinstance(secrets, list):
+            raise ValueError(
+                "unexpected Supabase secrets response shape: "
+                "expected a list or an object with a 'secrets' list"
+            )
+        entries = secrets
+    else:
+        raise ValueError(
+            "unexpected Supabase secrets response shape: "
+            "expected a list or an object with a 'secrets' list"
+        )
+
+    names: List[str] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str):
+            names.append(name)
+    return names
+
+
 def fetch_supabase_secrets(project_ref: str, access_token: str) -> List[str]:
     """Fetch all Edge Function secrets from a Supabase project.
 
@@ -1341,9 +1369,8 @@ def fetch_supabase_secrets(project_ref: str, access_token: str) -> List[str]:
             sys.exit(1)
 
         data = json.loads(body)
-        # Expected format: [{"name": "SOME_KEY", "value": "..."}, ...]
-        return [item["name"] for item in data]
-    except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
+        return _parse_supabase_secret_names(data)
+    except (http.client.HTTPException, OSError, json.JSONDecodeError, ValueError) as e:
         print(f"Error: Failed to fetch Supabase secrets: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
