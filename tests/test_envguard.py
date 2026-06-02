@@ -744,6 +744,10 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     supabase = envguard.parse_cli_args(["supabase", "abcd1234"])
     assert supabase.supabase_project == "abcd1234"
 
+    ci_template = envguard.parse_cli_args(["ci-template", "apps/web"])
+    assert ci_template.command == "ci-template"
+    assert ci_template.path == "apps/web"
+
 
 def test_parse_cli_args_accepts_update_command() -> None:
     args = envguard.parse_cli_args(["update"])
@@ -875,6 +879,82 @@ def test_discover_dotenv_paths_lists_real_env_as_wizard_choice(tmp_path: Path) -
     detected = envguard.discover_dotenv_paths(tmp_path, envguard.EnvguardConfig())
 
     assert detected == [tmp_path / ".env.example", tmp_path / ".env"]
+
+
+def test_build_ci_template_uses_safe_dotenv_and_relative_path(tmp_path: Path) -> None:
+    project = tmp_path / "apps" / "web"
+    project.mkdir(parents=True)
+    (project / ".env.example").write_text(
+        "API_KEY=not-a-secret-template-value\n",
+        encoding="utf-8",
+    )
+    (project / ".env").write_text("API_KEY=super-secret-live-value\n", encoding="utf-8")
+
+    template = envguard.build_ci_template(project, base_path=tmp_path)
+
+    assert "name: Envguard" in template
+    assert "envguard ci apps/web --dotenv apps/web/.env.example" in template
+    assert "super-secret-live-value" not in template
+    assert "not-a-secret-template-value" not in template
+    assert "dry output; no files were written" in template
+
+
+def test_build_ci_template_does_not_reference_real_dotenv_only(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "DATABASE_URL=postgres://secret@example/db\n",
+        encoding="utf-8",
+    )
+
+    template = envguard.build_ci_template(tmp_path, base_path=tmp_path)
+
+    assert "envguard ci" in template
+    assert "--dotenv .env" not in template
+    assert "postgres://secret@example/db" not in template
+    assert "Found only a real .env locally" in template
+
+
+def test_build_ci_template_reuses_config_and_supabase_secret_reference(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[tool.envguard]",
+                'dotenv = "config/example.env"',
+                'supabase_project = "project-ref"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "example.env").write_text(
+        "EDGE_SECRET=top-secret-value\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "supabase" / "functions").mkdir(parents=True)
+
+    template = envguard.build_ci_template(tmp_path, base_path=tmp_path)
+
+    assert "Detected [tool.envguard]" in template
+    assert "--dotenv config/example.env" not in template
+    assert "SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}" in template
+    assert "top-secret-value" not in template
+    assert "project-ref" not in template
+
+
+def test_ci_template_command_prints_without_writing_files(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / ".env.example").write_text("SECRET=template-only\n", encoding="utf-8")
+    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+
+    envguard.main(["ci-template", str(tmp_path)])
+    output = capsys.readouterr().out
+    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+
+    assert "name: Envguard" in output
+    assert "envguard ci" in output
+    assert before == after
 
 
 def test_detect_supabase_project_ref_reads_config_and_environment(
