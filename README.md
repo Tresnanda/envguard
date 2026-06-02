@@ -95,6 +95,13 @@ Emit machine-readable JSON:
 envguard --json
 ```
 
+Emit a compact one-line terminal summary for chat or CI step summaries:
+
+```bash
+envguard --summary
+# envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
+```
+
 Emit GitHub Actions annotations in CI logs:
 
 ```bash
@@ -276,7 +283,8 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 ## CLI Reference
 
 ```text
-usage: envguard [-h] [--path PATH] [--json] [--github-annotations] [--fix]
+usage: envguard [-h] [--path PATH] [--json] [--summary]
+                [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--debug] [--details] [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
@@ -294,6 +302,7 @@ options:
   -h, --help            Show help and exit.
   --path PATH           Project path to scan. Defaults to the current directory.
   --json                Print a JSON report.
+  --summary             Print one compact terminal summary line.
   --github-annotations  Print GitHub Actions annotations for CI logs.
   --fix                 Interactively remove unused keys from .env.example.
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
@@ -308,6 +317,16 @@ options:
   --no-wizard           Run the default scan instead of the interactive guide.
   --debug               Print detected references and parsed keys.
 ```
+
+## Summary Output
+
+`--summary` prints exactly one plain-text line and uses the same exit-code rules as the default report:
+
+```text
+envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
+```
+
+The status is `red` when blocking findings would make envguard exit non-zero, `yellow` when findings are present but allowed/advisory, and `green` when the scan is clean. Counts include nonzero `missing`, `unused`, `optional`, `external`, `ignored`, and Supabase `orphaned` findings.
 
 ## JSON Output
 

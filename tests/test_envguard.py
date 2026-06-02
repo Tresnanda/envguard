@@ -346,6 +346,115 @@ def test_scan_directory_honors_user_exclude_globs(tmp_path: Path) -> None:
     assert set(refs) == {"APP_SECRET"}
 
 
+def _mock_supabase_secrets_response(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+    status: int = 200,
+) -> None:
+    import http.client
+
+    body_text = payload if isinstance(payload, str) else json.dumps(payload)
+
+    response_status = status
+
+    class FakeResponse:
+        status = response_status
+
+        def read(self) -> bytes:
+            return body_text.encode("utf-8")
+
+    class FakeConnection:
+        def __init__(self, netloc: str, timeout: int) -> None:
+            self.netloc = netloc
+            self.timeout = timeout
+            self.closed = False
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            body: Optional[str] = None,
+            headers: Optional[dict[str, str]] = None,
+        ) -> None:
+            self.method = method
+            self.path = path
+            self.body = body
+            self.headers = headers
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", FakeConnection)
+
+
+def test_fetch_supabase_secrets_ignores_malformed_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        [
+            {"name": "API_KEY"},
+            {"value": "missing name"},
+            {"name": 123},
+            ["not", "an", "object"],
+            "not an object",
+            {"name": "EDGE_SECRET"},
+        ],
+    )
+
+    assert envguard.fetch_supabase_secrets("project-ref", "token") == [
+        "API_KEY",
+        "EDGE_SECRET",
+    ]
+
+
+def test_fetch_supabase_secrets_accepts_secrets_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {"secrets": [{"name": "FIRST_SECRET"}, {"name": None}, {"name": "SECOND_SECRET"}]},
+    )
+
+    assert envguard.fetch_supabase_secrets("project-ref", "token") == [
+        "FIRST_SECRET",
+        "SECOND_SECRET",
+    ]
+
+
+def test_fetch_supabase_secrets_reports_unexpected_top_level_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mock_supabase_secrets_response(monkeypatch, {"data": []})
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", "token")
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Failed to fetch Supabase secrets" in err
+    assert "expected a list or an object with a 'secrets' list" in err
+
+
+def test_fetch_supabase_secrets_reports_invalid_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mock_supabase_secrets_response(monkeypatch, "{not json")
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", "token")
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Failed to fetch Supabase secrets" in err
+    assert "Expecting property name enclosed in double quotes" in err
+
+
 def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     ref_map = {
         "DATABASE_URL": [
@@ -733,6 +842,40 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
+    result = envguard.ScanResult(
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+        optional_missing=["OPTIONAL_KEY"],
+        external_missing=["EXTERNAL_KEY"],
+        ignored_missing=["IGNORED_KEY"],
+        supabase_orphans=["LEGACY_SECRET"],
+    )
+
+    envguard._summary_output(result)
+
+    assert capsys.readouterr().out == (
+        "envguard: red — 1 missing, 1 unused, 1 optional, 1 external, "
+        "1 ignored, 1 orphaned (exit 1)\n"
+    )
+
+
+def test_summary_output_reflects_allow_flags_and_clean_status() -> None:
+    allowed = envguard.ScanResult(
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+    )
+
+    assert envguard.format_summary_line(
+        allowed,
+        allow_unused=True,
+        allow_missing=True,
+    ) == "envguard: yellow — 1 missing, 1 unused (exit 0)"
+    assert envguard.format_summary_line(envguard.ScanResult()) == (
+        "envguard: green — clean (exit 0)"
+    )
+
+
 def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     positional = envguard.parse_cli_args(["apps/web"])
     assert positional.path == "apps/web"
@@ -747,6 +890,10 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     ci_template = envguard.parse_cli_args(["ci-template", "apps/web"])
     assert ci_template.command == "ci-template"
     assert ci_template.path == "apps/web"
+
+    summary = envguard.parse_cli_args(["--summary", "apps/web"])
+    assert summary.summary is True
+    assert summary.path == "apps/web"
 
 
 def test_parse_cli_args_accepts_update_command() -> None:
