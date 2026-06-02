@@ -993,6 +993,42 @@ def discover_dotenv_path(scan_path: Path, config: EnvguardConfig) -> Optional[Pa
     return None
 
 
+def _clean_dotenv_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+
+    cleaned: List[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            cleaned.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            cleaned.append(char)
+            escaped = True
+            continue
+        if quote:
+            cleaned.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            cleaned.append(char)
+            continue
+        if char == "#" and (index == 0 or value[index - 1].isspace()):
+            break
+        cleaned.append(char)
+
+    value = "".join(cleaned).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value.strip()
+
+
 def parse_dotenv_value(path: Path, key: str) -> Optional[str]:
     """Read a single dotenv value without exposing it in output."""
     if not path.exists():
@@ -1013,11 +1049,7 @@ def parse_dotenv_value(path: Path, key: str) -> Optional[str]:
         match = pattern.match(stripped)
         if not match:
             continue
-        value = match.group(1).strip()
-        if "#" in value and not value.startswith(("'", '"')):
-            value = value.split("#", 1)[0].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
+        value = _clean_dotenv_value(match.group(1))
         return value or None
     return None
 

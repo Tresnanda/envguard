@@ -49,6 +49,28 @@ def test_parse_dotenv_value_reads_secret_values_without_printing(tmp_path: Path)
     assert envguard.parse_dotenv_value(dotenv, "MISSING") is None
 
 
+def test_parse_dotenv_value_handles_real_dotenv_quotes_and_comments(
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "\n".join(
+            [
+                "SUPABASE_ACCESS_TOKEN = \"sbp_local_token\" # local dev token",
+                "PASSWORD='abc#123' # keep hash inside quotes",
+                "PUBLIC_URL=https://example.test/path#section",
+                "EMPTY_VALUE=",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert envguard.parse_dotenv_value(dotenv, "SUPABASE_ACCESS_TOKEN") == "sbp_local_token"
+    assert envguard.parse_dotenv_value(dotenv, "PASSWORD") == "abc#123"
+    assert envguard.parse_dotenv_value(dotenv, "PUBLIC_URL") == "https://example.test/path#section"
+    assert envguard.parse_dotenv_value(dotenv, "EMPTY_VALUE") is None
+
+
 def test_detect_references_finds_common_environment_patterns(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text(

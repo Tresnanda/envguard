@@ -161,18 +161,19 @@ Create an access token at [app.supabase.com/account/tokens](https://app.supabase
 
 The Supabase access token can come from `SUPABASE_ACCESS_TOKEN` in your shell, the selected dotenv file, the project `.env`, or a secure prompt in `envguard wizard`. Tokens entered in the wizard are used only for that run. They are not printed, written to `pyproject.toml`, or included in the generated command preview.
 
-## `.env.example` Format
+## Dotenv Format
 
-`envguard` accepts standard dotenv-style keys:
+`envguard` accepts standard dotenv-style keys from `.env.example`, `.env.sample`, `.env.template`, or a real `.env` file passed with `--dotenv .env`:
 
 ```bash
 DATABASE_URL=postgres://localhost
 API_KEY=
 BARE_SECRET
 export SUPABASE_URL=https://example.supabase.co
+SUPABASE_ACCESS_TOKEN="sbp_..." # comments are fine
 ```
 
-Comments and blank lines are ignored. Invalid variable names are skipped.
+Comments and blank lines are ignored. Invalid variable names are skipped. Values are used only to discover sensitive integration tokens such as `SUPABASE_ACCESS_TOKEN`; envguard does not print dotenv values in audit output.
 
 ## Project Configuration
 
