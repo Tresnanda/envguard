@@ -805,6 +805,15 @@ def test_discover_dotenv_path_prefers_templates_before_dotenv(tmp_path: Path) ->
     assert detected == tmp_path / ".env.sample"
 
 
+def test_discover_dotenv_paths_lists_real_env_as_wizard_choice(tmp_path: Path) -> None:
+    (tmp_path / ".env.example").write_text("SECRET=\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SECRET=value\n", encoding="utf-8")
+
+    detected = envguard.discover_dotenv_paths(tmp_path, envguard.EnvguardConfig())
+
+    assert detected == [tmp_path / ".env.example", tmp_path / ".env"]
+
+
 def test_detect_supabase_project_ref_reads_config_and_environment(
     tmp_path: Path,
 ) -> None:
@@ -914,6 +923,37 @@ def test_run_wizard_uses_direct_token_only_for_current_run(
     assert captured["token"] == "sbp_direct_token"
     assert envguard.os.environ.get("SUPABASE_ACCESS_TOKEN") is None
     assert "sbp_direct_token" not in capsys.readouterr().out
+
+
+def test_run_wizard_can_select_real_env_when_template_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / ".env.example").write_text("DATABASE_URL=\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("DATABASE_URL=postgres://localhost\n", encoding="utf-8")
+    answers = iter([str(tmp_path), "2"])
+    confirms = iter([False, False, True])
+    captured: dict[str, object] = {}
+
+    def fake_main(args: list[str]) -> None:
+        captured["args"] = args
+
+    monkeypatch.setattr(envguard, "_ask_text", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(envguard, "_ask_confirm", lambda *_args, **_kwargs: next(confirms))
+    monkeypatch.setattr(envguard, "main", fake_main)
+
+    envguard.run_wizard()
+
+    assert captured["args"] == [
+        "--path",
+        str(tmp_path.resolve()),
+        "--dotenv",
+        str(tmp_path / ".env"),
+    ]
+    out = capsys.readouterr().out
+    assert "Detected dotenv files:" in out
+    assert "2) " + str(tmp_path / ".env") in out
 
 
 def test_parse_cli_args_accepts_wizard_command() -> None:

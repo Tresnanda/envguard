@@ -65,7 +65,7 @@ Run the audit from the root of a project that contains `.env.example`:
 envguard
 ```
 
-On an interactive terminal, the bare command opens a guided command builder. It detects common dotenv templates, Supabase Edge Function projects, and existing project config, then shows the generated command before running it. To force the immediate current-directory scan, use:
+On an interactive terminal, the bare command opens a guided command builder. It detects dotenv files including `.env.example` and real `.env`, Supabase Edge Function projects, and existing project config, then shows the generated command before running it. To force the immediate current-directory scan, use:
 
 ```bash
 envguard --no-wizard
@@ -101,7 +101,7 @@ Emit GitHub Actions annotations in CI logs:
 envguard ci
 ```
 
-Use a custom dotenv example file:
+Use a custom dotenv file:
 
 ```bash
 envguard --dotenv config/example.env

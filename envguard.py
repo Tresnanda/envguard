@@ -978,18 +978,34 @@ def write_project_config(
 DOTENV_CANDIDATES = (".env.example", ".env.sample", ".env.template", ".env")
 
 
-def discover_dotenv_path(scan_path: Path, config: EnvguardConfig) -> Optional[Path]:
-    """Find the best dotenv template for a scanned project."""
+def discover_dotenv_paths(scan_path: Path, config: EnvguardConfig) -> List[Path]:
+    """Find available dotenv files for a scanned project, in default priority order."""
     project_root = scan_path if scan_path.is_dir() else scan_path.parent
+    paths: List[Path] = []
+    seen: set[Path] = set()
+
     if config.dotenv:
         configured = _resolve_config_path(config.dotenv, scan_path)
         if configured.exists():
-            return configured
+            resolved = configured.resolve()
+            paths.append(configured)
+            seen.add(resolved)
 
     for name in DOTENV_CANDIDATES:
         candidate = project_root / name
         if candidate.exists():
-            return candidate
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                paths.append(candidate)
+                seen.add(resolved)
+    return paths
+
+
+def discover_dotenv_path(scan_path: Path, config: EnvguardConfig) -> Optional[Path]:
+    """Find the default dotenv file for a scanned project."""
+    paths = discover_dotenv_paths(scan_path, config)
+    if paths:
+        return paths[0]
     return None
 
 
@@ -1165,6 +1181,30 @@ def _ask_confirm(message: str, default: bool = False) -> bool:
     return value in {"y", "yes"}
 
 
+def _choose_dotenv_path(paths: List[Path]) -> str:
+    """Choose a dotenv file for the wizard, including real .env files."""
+    if not paths:
+        return _ask_text("Dotenv file (.env.example, .env, or blank to skip)", "")
+    if len(paths) == 1:
+        return _ask_text("Dotenv file (.env.example or .env)", str(paths[0]))
+
+    print("Detected dotenv files:")
+    for index, path in enumerate(paths, start=1):
+        print(f"  {index}) {path}")
+    print(f"  {len(paths) + 1}) Custom path")
+    print(f"  {len(paths) + 2}) Skip dotenv file")
+    choice = _ask_text("Dotenv file choice", "1").strip()
+    if choice.isdigit():
+        selected = int(choice)
+        if 1 <= selected <= len(paths):
+            return str(paths[selected - 1])
+        if selected == len(paths) + 1:
+            return _ask_text("Custom dotenv file", "")
+        if selected == len(paths) + 2:
+            return ""
+    return choice
+
+
 def _format_command(args: List[str]) -> str:
     return "envguard " + " ".join(shlex.quote(item) for item in args)
 
@@ -1190,12 +1230,12 @@ def run_wizard() -> None:
     """Interactive command builder for envguard."""
     scan_path = Path(_ask_text("Project path", ".")).expanduser().resolve()
     config = load_project_config(scan_path)
-    detected_dotenv = discover_dotenv_path(scan_path, config)
+    detected_dotenv_paths = discover_dotenv_paths(scan_path, config)
+    detected_dotenv = detected_dotenv_paths[0] if detected_dotenv_paths else None
     detected_supabase = detect_supabase_project_ref(scan_path, os.environ, config)
     edge_functions = has_supabase_edge_functions(scan_path)
 
-    dotenv_default = str(detected_dotenv) if detected_dotenv else ""
-    dotenv = _ask_text("Dotenv template", dotenv_default) if dotenv_default else ""
+    dotenv = _choose_dotenv_path(detected_dotenv_paths)
     selected_dotenv = Path(dotenv) if dotenv else detected_dotenv
     token_info = detect_supabase_access_token(scan_path, selected_dotenv, os.environ)
     supabase_token = token_info[0] if token_info else None
@@ -1428,7 +1468,7 @@ def _rich_output(
     summary = "[bold cyan]envguard[/] — Environment Variable Audit\n"
     summary += f"  • {total_refs} references found ({unique_keys} unique keys)"
     if dotenv_path:
-        summary += f"\n  • .env.example: [green]{dotenv_path}[/]"
+        summary += f"\n  • dotenv file: [green]{dotenv_path}[/]"
     if supabase_ref:
         summary += f"\n  • Supabase project: [green]{supabase_ref}[/]"
     console.print(Panel(summary, border_style="cyan"))
@@ -1990,7 +2030,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dotenv",
         type=str,
         default=None,
-        help="Path to dotenv template (default: auto-detect .env.example/.env.sample)",
+        help="Path to dotenv file (default: auto-detect .env.example/.env.sample/.env)",
     )
     parser.add_argument(
         "--debug",
