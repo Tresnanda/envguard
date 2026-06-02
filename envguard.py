@@ -1619,9 +1619,45 @@ def _rich_output(
     console.print()
 
 
-def _json_output(result: ScanResult):
+def _json_summary(
+    result: ScanResult,
+    allow_unused: bool = False,
+    allow_missing: bool = False,
+) -> dict[str, object]:
+    """Return compact metadata for JSON consumers."""
+    blocking = has_blocking_issues(
+        result,
+        allow_unused=allow_unused,
+        allow_missing=allow_missing,
+    )
+    return {
+        "counts": {
+            "unused": len(result.unused),
+            "missing": len(result.missing),
+            "optional_missing": len(result.optional_missing),
+            "external_missing": len(result.external_missing),
+            "ignored_missing": len(result.ignored_missing),
+            "supabase_orphans": len(result.supabase_orphans),
+            "referenced_keys": len(result.references),
+            "references": sum(len(refs) for refs in result.references.values()),
+        },
+        "blocking": blocking,
+        "exit_code": 1 if blocking else 0,
+    }
+
+
+def _json_output(
+    result: ScanResult,
+    allow_unused: bool = False,
+    allow_missing: bool = False,
+) -> None:
     """JSON machine-readable output."""
     output = {
+        "summary": _json_summary(
+            result,
+            allow_unused=allow_unused,
+            allow_missing=allow_missing,
+        ),
         "unused": result.unused,
         "missing": result.missing,
         "optional_missing": result.optional_missing,
@@ -2261,11 +2297,19 @@ def main(argv: Optional[List[str]] = None):
     if args.github_annotations:
         _github_annotations_output(result)
     elif args.json:
-        _json_output(result)
+        _json_output(
+            result,
+            allow_unused=args.allow_unused,
+            allow_missing=args.allow_missing,
+        )
     else:
         if Console is None:
             print("For prettier output, install rich: pip install rich", file=sys.stderr)
-            _json_output(result)
+            _json_output(
+                result,
+                allow_unused=args.allow_unused,
+                allow_missing=args.allow_missing,
+            )
         else:
             _rich_output(
                 result,

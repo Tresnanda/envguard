@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -668,6 +669,68 @@ def test_allow_flags_control_blocking_issue_detection() -> None:
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=False) is True
     assert envguard.has_blocking_issues(result, allow_unused=False, allow_missing=True) is True
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
+
+
+def test_json_output_includes_summary_metadata(capsys) -> None:
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file="/repo/src/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ],
+            "OPTIONAL_KEY": [
+                envguard.EnvReference(
+                    key="OPTIONAL_KEY",
+                    file="/repo/src/app.py",
+                    line=13,
+                    pattern_type="os.getenv",
+                    requirement="optional",
+                    reason="inline default or guard",
+                )
+            ],
+        },
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+        optional_missing=["OPTIONAL_KEY"],
+        external_missing=["EXTERNAL_KEY"],
+        ignored_missing=["IGNORED_KEY"],
+        supabase_orphans=["LEGACY_SECRET"],
+    )
+
+    envguard._json_output(result)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["summary"] == {
+        "counts": {
+            "unused": 1,
+            "missing": 1,
+            "optional_missing": 1,
+            "external_missing": 1,
+            "ignored_missing": 1,
+            "supabase_orphans": 1,
+            "referenced_keys": 2,
+            "references": 2,
+        },
+        "blocking": True,
+        "exit_code": 1,
+    }
+    assert output["unused"] == ["OLD_KEY"]
+    assert output["missing"] == ["MISSING_KEY"]
+    assert output["optional_missing"] == ["OPTIONAL_KEY"]
+    assert output["external_missing"] == ["EXTERNAL_KEY"]
+    assert output["ignored_missing"] == ["IGNORED_KEY"]
+    assert output["supabase_orphans"] == ["LEGACY_SECRET"]
+    assert output["references"]["MISSING_KEY"][0]["file"] == "/repo/src/app.py"
+
+    envguard._json_output(result, allow_unused=True, allow_missing=True)
+    relaxed_output = json.loads(capsys.readouterr().out)
+
+    assert relaxed_output["summary"]["blocking"] is False
+    assert relaxed_output["summary"]["exit_code"] == 0
 
 
 def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
