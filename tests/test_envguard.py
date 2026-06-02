@@ -1069,3 +1069,136 @@ def test_main_opens_wizard_for_bare_interactive_command(
     envguard.main([])
 
     assert called["wizard"] is True
+
+
+def test_fix_dry_run_and_real_env_flags_parse() -> None:
+    args = envguard.parse_cli_args(["--fix-dry-run", "--fix-real-env"])
+
+    assert args.fix_dry_run is True
+    assert args.fix_real_env is True
+
+
+def test_is_template_dotenv_path_classifies_safe_templates() -> None:
+    assert envguard.is_template_dotenv_path(Path(".env.example"))
+    assert envguard.is_template_dotenv_path(Path(".env.sample"))
+    assert envguard.is_template_dotenv_path(Path(".env.template"))
+    assert envguard.is_template_dotenv_path(Path(".env.dist"))
+    assert not envguard.is_template_dotenv_path(Path(".env"))
+    assert not envguard.is_template_dotenv_path(Path("production.env"))
+
+
+def test_interactive_fix_refuses_real_env_by_default(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dotenv = tmp_path / ".env"
+    original = "OLD_SECRET=real\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    assert "Refusing to prune a real dotenv file" in capsys.readouterr().err
+
+
+def test_interactive_fix_dry_run_does_not_prompt_or_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "export OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(
+        envguard.Confirm,
+        "ask",
+        lambda *_args, **_kwargs: pytest.fail("dry run should not prompt"),
+    )
+
+    envguard.interactive_fix(result, dotenv, dry_run=True)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env.example.bak").exists()
+    out = capsys.readouterr().out
+    assert "Dry run:" in out
+    assert "OLD_SECRET=<redacted>" in out
+    assert "export OLD_SECRET=" not in out
+
+
+def test_interactive_fix_dry_run_can_preview_real_env(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dotenv = tmp_path / ".env"
+    original = "OLD_SECRET=real\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    envguard.interactive_fix(result, dotenv, dry_run=True)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    out = capsys.readouterr().out
+    assert "Dry run:" in out
+    assert "OLD_SECRET=<redacted>" in out
+    assert "OLD_SECRET=real" not in out
+
+
+def test_interactive_fix_creates_backup_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert dotenv.read_text(encoding="utf-8") == "KEEP_ME=1\n"
+    assert (tmp_path / ".env.example.bak").read_text(encoding="utf-8") == original
+
+
+def test_interactive_fix_backup_does_not_follow_existing_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    malicious_target = tmp_path / "outside-target"
+    (tmp_path / ".env.example.bak").symlink_to(malicious_target)
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert not malicious_target.exists()
+    assert (tmp_path / ".env.example.bak").is_symlink()
+    assert (tmp_path / ".env.example.bak.1").read_text(encoding="utf-8") == original
+
+
+def test_interactive_fix_does_not_follow_dotenv_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "real-env-target"
+    original = "OLD_SECRET=real\nKEEP_ME=1\n"
+    target.write_text(original, encoding="utf-8")
+    dotenv = tmp_path / ".env.example"
+    dotenv.symlink_to(target)
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env.example.bak").exists()
+    assert "Refusing to prune a symlinked dotenv file" in capsys.readouterr().err
