@@ -1757,19 +1757,82 @@ def has_blocking_issues(
 # ─── Interactive Fix ───────────────────────────────────────────────────────
 
 
-def interactive_fix(result: ScanResult, dotenv_path: Path):
-    """Interactively prune unused entries from .env.example."""
+SAFE_FIX_DOTENV_SUFFIXES = (
+    ".example",
+    ".sample",
+    ".template",
+    ".tmpl",
+    ".dist",
+)
+DOTENV_ASSIGNMENT_RE = re.compile(
+    r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
+)
+
+
+def is_template_dotenv_path(path: Path) -> bool:
+    """Return whether --fix can safely prune this dotenv path by default."""
+    name = path.name.lower()
+    return name.startswith(".env.") and name.endswith(SAFE_FIX_DOTENV_SUFFIXES)
+
+
+def _redacted_dotenv_assignment(line: str) -> str:
+    """Return a dry-run preview that never exposes dotenv values."""
+    match = DOTENV_ASSIGNMENT_RE.match(line.strip())
+    if not match:
+        return "<unparseable dotenv assignment>"
+    return f"{match.group(1)}=<redacted>"
+
+
+def _write_backup_exclusive(path: Path, content: str) -> Path:
+    """Write a backup without overwriting or following existing filesystem entries."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    index = 0
+    while True:
+        suffix = ".bak" if index == 0 else f".bak.{index}"
+        candidate = path.with_name(f"{path.name}{suffix}")
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            index += 1
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as backup:
+            backup.write(content)
+        return candidate
+
+
+def interactive_fix(
+    result: ScanResult,
+    dotenv_path: Path,
+    *,
+    dry_run: bool = False,
+    allow_real_env: bool = False,
+):
+    """Interactively prune unused entries from a template dotenv file."""
     if not result.unused:
-        print("No unused keys to prune from .env.example.")
+        print(f"No unused keys to prune from {dotenv_path}.")
         return
 
     if Confirm is None:
         print("rich is required for --fix mode. Install it: pip install rich")
         return
 
+    if not dry_run and not allow_real_env and not is_template_dotenv_path(dotenv_path):
+        print(
+            "Refusing to prune a real dotenv file by default: "
+            f"{dotenv_path}\n"
+            "Use --fix-dry-run to preview removals, or pass --fix-real-env "
+            "if you intentionally want to edit this file.",
+            file=sys.stderr,
+        )
+        return
+
     console = Console()
 
-    # Filter .env.example lines to keep
+    # Filter dotenv lines to keep
     unused_set = set(result.unused)
     try:
         lines = dotenv_path.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -1793,10 +1856,13 @@ def interactive_fix(result: ScanResult, dotenv_path: Path):
             keep_lines.append(line)
             continue
 
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=", stripped)
+        match = DOTENV_ASSIGNMENT_RE.match(stripped)
         if match and match.group(1) in unused_set:
             key = match.group(1)
-            if Confirm and Confirm.ask(
+            if dry_run:
+                removed_lines.append(line.rstrip())
+                keep_lines.append(line)
+            elif Confirm and Confirm.ask(
                 f"Remove unused key [yellow]{key}[/]?",
                 default=False,
             ):
@@ -1807,12 +1873,23 @@ def interactive_fix(result: ScanResult, dotenv_path: Path):
         else:
             keep_lines.append(line)
 
+    if dry_run:
+        if removed_lines:
+            console.print("[bold yellow]Dry run:[/] would remove these line(s):")
+            for line in removed_lines:
+                console.print(f"  [yellow]-[/] {_redacted_dotenv_assignment(line)}")
+        else:
+            console.print("[dim]Dry run: no matching unused assignments found.[/]")
+        return
+
     if removed_lines:
+        backup_path = _write_backup_exclusive(dotenv_path, "".join(lines))
         dotenv_path.write_text("".join(keep_lines), encoding="utf-8")
         console.print(
             f"\n[green]✓[/] Removed {len(removed_lines)} unused key(s) "
             f"from [cyan]{dotenv_path}[/]"
         )
+        console.print(f"[dim]Backup written to {backup_path}[/]")
     else:
         console.print("[dim]No changes made.[/]")
 
@@ -2054,7 +2131,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="Interactively prune unused entries from .env.example",
+        help="Interactively prune unused entries from a template dotenv file",
+    )
+    parser.add_argument(
+        "--fix-dry-run",
+        action="store_true",
+        help="Preview unused dotenv entries that --fix would prune without writing files",
+    )
+    parser.add_argument(
+        "--fix-real-env",
+        action="store_true",
+        help=(
+            "Allow --fix to edit a real .env file instead of only "
+            ".env.example/sample/template files"
+        ),
     )
     parser.add_argument(
         "--supabase-project",
@@ -2320,8 +2410,13 @@ def main(argv: Optional[List[str]] = None):
             )
 
     # ── Interactive fix ────────────────────────────────────────────────────
-    if args.fix and dotenv_path.exists():
-        interactive_fix(result, dotenv_path)
+    if (args.fix or args.fix_dry_run) and dotenv_path.exists():
+        interactive_fix(
+            result,
+            dotenv_path,
+            dry_run=args.fix_dry_run,
+            allow_real_env=args.fix_real_env,
+        )
 
     # Exit code: non-zero if any issues found
     if has_blocking_issues(
