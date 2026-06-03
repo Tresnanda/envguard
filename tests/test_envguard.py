@@ -891,9 +891,132 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     assert ci_template.command == "ci-template"
     assert ci_template.path == "apps/web"
 
+    doctor = envguard.parse_cli_args(["doctor", "apps/web"])
+    assert doctor.command == "doctor"
+    assert doctor.path == "apps/web"
+
+    matrix = envguard.parse_cli_args(["matrix", "apps/api"])
+    assert matrix.command == "doctor"
+    assert matrix.path == "apps/api"
+
     summary = envguard.parse_cli_args(["--summary", "apps/web"])
     assert summary.summary is True
     assert summary.path == "apps/web"
+
+
+def test_build_secrets_matrix_reports_sources_and_requirements_without_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ref_map = {
+        "DATABASE_URL": [
+            envguard.EnvReference("DATABASE_URL", "app.py", 1, "os.getenv")
+        ],
+        "SHELL_ONLY": [envguard.EnvReference("SHELL_ONLY", "app.py", 2, "os.getenv")],
+        "EDGE_SECRET": [
+            envguard.EnvReference("EDGE_SECRET", "edge.ts", 3, "Deno.env.get")
+        ],
+        "MISSING_SECRET": [
+            envguard.EnvReference("MISSING_SECRET", "app.py", 4, "os.getenv")
+        ],
+        "OPTIONAL_KEY": [
+            envguard.EnvReference(
+                "OPTIONAL_KEY",
+                "app.py",
+                5,
+                "os.getenv",
+                requirement="optional",
+            )
+        ],
+        "EXTERNAL_KEY": [
+            envguard.EnvReference(
+                "EXTERNAL_KEY",
+                "app.py",
+                6,
+                "process.env.KEY",
+                requirement="external",
+            )
+        ],
+        "IGNORED_KEY": [envguard.EnvReference("IGNORED_KEY", "app.py", 7, "os.getenv")],
+    }
+
+    matrix = envguard.build_secrets_matrix(
+        ref_map,
+        dotenv_keys=["DATABASE_URL", "UNUSED_DOTENV"],
+        env={"SHELL_ONLY": "shell-secret", "OPTIONAL_KEY": "optional-secret"},
+        supabase_keys=["EDGE_SECRET", "ORPHAN_EDGE_SECRET"],
+        ignore_keys=["IGNORED_KEY"],
+    )
+
+    rows = {row.key: row for row in matrix.rows}
+    assert rows["DATABASE_URL"].status == "ready"
+    assert rows["DATABASE_URL"].dotenv is True
+    assert rows["SHELL_ONLY"].environment is True
+    assert rows["EDGE_SECRET"].supabase is True
+    assert rows["MISSING_SECRET"].status == "missing"
+    assert rows["OPTIONAL_KEY"].status == "ready"
+    assert rows["EXTERNAL_KEY"].status == "external-missing"
+    assert rows["IGNORED_KEY"].requirement == "ignored"
+    assert rows["IGNORED_KEY"].status == "ignored-missing"
+    assert matrix.unused_dotenv == ["UNUSED_DOTENV"]
+    assert matrix.supabase_orphans == ["ORPHAN_EDGE_SECRET"]
+    assert envguard.secrets_matrix_has_required_missing(matrix)
+
+    envguard._matrix_json_output(matrix)
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["summary"]["counts"]["missing"] == 1
+    assert payload["rows"][0]["available"]["supabase"] in {True, False}
+    assert "shell-secret" not in output
+    assert "optional-secret" not in output
+
+
+def test_doctor_command_prints_json_matrix_without_dotenv_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                'DATABASE_URL = os.getenv("DATABASE_URL")',
+                'SHELL_ONLY = os.getenv("SHELL_ONLY")',
+                'MISSING_SECRET = os.getenv("MISSING_SECRET")',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DATABASE_URL=DOTENV_VALUE_SHOULD_STAY_HIDDEN\n"
+        "UNUSED_SECRET=UNUSED_VALUE_SHOULD_STAY_HIDDEN\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SHELL_ONLY", "ENV_VALUE_SHOULD_STAY_HIDDEN")
+
+    envguard.main(["--json", "--allow-missing", "doctor", str(tmp_path)])
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    rows = {row["key"]: row for row in payload["rows"]}
+
+    assert rows["DATABASE_URL"]["available"]["dotenv"] is True
+    assert rows["SHELL_ONLY"]["available"]["environment"] is True
+    assert rows["MISSING_SECRET"]["status"] == "missing"
+    assert payload["unused_dotenv"] == ["UNUSED_SECRET"]
+    assert "DOTENV_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert "UNUSED_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert "ENV_VALUE_SHOULD_STAY_HIDDEN" not in output
+
+
+def test_doctor_command_exits_nonzero_for_required_missing(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.main(["doctor", str(tmp_path)])
+
+    assert exc.value.code == 1
 
 
 def test_parse_cli_args_accepts_update_command() -> None:
