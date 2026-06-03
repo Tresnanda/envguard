@@ -479,6 +479,100 @@ def test_fetch_supabase_secrets_reports_invalid_json(
     assert "Expecting property name enclosed in double quotes" in err
 
 
+def test_fetch_supabase_secrets_redacts_json_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api_token = "sbp_request_token_123456789"
+    body_token = "sbp_response_token_123456789"
+    body_api_key = "sk_test_abcdefghijklmnopqrstuvwxyz"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {
+            "error": "unauthorized",
+            "message": f"invalid bearer token Bearer {body_token}",
+            "access_token": api_token,
+            "details": {
+                "api_key": body_api_key,
+                "request_id": "req_12345",
+            },
+        },
+        status=401,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", api_token)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Supabase API returned 401" in err
+    assert '"error":"unauthorized"' in err
+    assert '"message":"invalid bearer token Bearer [REDACTED]"' in err
+    assert '"access_token":"[REDACTED]"' in err
+    assert '"api_key":"[REDACTED]"' in err
+    assert '"request_id":"req_12345"' in err
+    assert api_token not in err
+    assert body_token not in err
+    assert body_api_key not in err
+
+
+def test_fetch_supabase_secrets_redacts_malformed_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_token = "sbp_raw_response_token_123456789"
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signatureX"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        f"not json: access_token={raw_token}; Authorization: Bearer {jwt}",
+        status=500,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", raw_token)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Supabase API returned 500" in err
+    assert "access_token=[REDACTED]" in err
+    assert "Authorization: Bearer [REDACTED]" in err
+    assert raw_token not in err
+    assert jwt not in err
+
+
+def test_delete_supabase_secrets_redacts_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    leaked_secret = "sbp_delete_response_token_123456789"
+    leaked_password = "correct-horse-battery-staple"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {
+            "error": "delete_failed",
+            "message": "secret cannot be deleted",
+            "secret_value": leaked_secret,
+            "password": leaked_password,
+        },
+        status=403,
+    )
+
+    assert not envguard.delete_supabase_secrets(
+        "project-ref",
+        "sbp_request_token_123456789",
+        ["OLD_SECRET"],
+    )
+
+    err = capsys.readouterr().err
+    assert "Supabase API returned 403" in err
+    assert '"error":"delete_failed"' in err
+    assert '"message":"secret cannot be deleted"' in err
+    assert '"secret_value":"[REDACTED]"' in err
+    assert '"password":"[REDACTED]"' in err
+    assert leaked_secret not in err
+    assert leaked_password not in err
+
+
 def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     ref_map = {
         "DATABASE_URL": [
