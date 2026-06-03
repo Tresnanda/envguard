@@ -354,7 +354,7 @@ options:
   --fix-dry-run         Preview unused dotenv entries that --fix would prune without writing files.
   --fix-real-env        Allow --fix to edit a real .env file instead of only templates.
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
-  --dotenv PATH         Path to dotenv example file. Defaults to <path>/.env.example.
+  --dotenv PATH         Path to dotenv file. Defaults to auto-detected templates or .env.
   --baseline PATH       Suppress known findings listed in an envguard baseline JSON file.
   --write-baseline PATH Write current findings to a secret-safe baseline JSON file and exit.
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
