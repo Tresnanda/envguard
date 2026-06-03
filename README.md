@@ -309,7 +309,8 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 
 ```text
 usage: envguard [-h] [--path PATH] [--json] [--summary]
-                [--github-annotations] [--fix]
+                [--github-annotations] [--fix] [--fix-dry-run]
+                [--fix-real-env]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--debug] [--details] [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
@@ -330,6 +331,8 @@ options:
   --summary             Print one compact terminal summary line.
   --github-annotations  Print GitHub Actions annotations for CI logs.
   --fix                 Interactively remove unused keys from .env.example.
+  --fix-dry-run         Preview unused dotenv entries that --fix would prune without writing files.
+  --fix-real-env        Allow --fix to edit a real .env file instead of only templates.
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
   --dotenv PATH         Path to dotenv example file. Defaults to <path>/.env.example.
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
