@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -1663,3 +1664,53 @@ def test_interactive_fix_does_not_follow_dotenv_symlink(
     assert target.read_text(encoding="utf-8") == original
     assert not (tmp_path / ".env.example.bak").exists()
     assert "Refusing to prune a symlinked dotenv file" in capsys.readouterr().err
+
+
+def test_interactive_fix_atomic_write_replaces_swapped_symlink_not_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    malicious_target = tmp_path / "outside-target"
+    target_original = "DO_NOT_CHANGE=1\n"
+    malicious_target.write_text(target_original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+    real_backup = envguard._write_backup_exclusive
+
+    def backup_then_swap(path: Path, content: str) -> Path:
+        backup_path = real_backup(path, content)
+        path.unlink()
+        path.symlink_to(malicious_target)
+        return backup_path
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(envguard, "_write_backup_exclusive", backup_then_swap)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert malicious_target.read_text(encoding="utf-8") == target_original
+    assert not dotenv.is_symlink()
+    assert dotenv.read_text(encoding="utf-8") == "KEEP_ME=1\n"
+    assert (tmp_path / ".env.example.bak").read_text(encoding="utf-8") == original
+
+
+def test_atomic_write_no_follow_keeps_original_when_replace_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+
+    def fail_replace(src: os.PathLike[str], dst: os.PathLike[str]) -> None:
+        raise OSError(f"simulated replace failure: {src} -> {dst}")
+
+    monkeypatch.setattr(envguard.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        envguard._atomic_write_no_follow(dotenv, "KEEP_ME=1\n", 0o600)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".*.envguard-*.tmp")) == []
