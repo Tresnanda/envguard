@@ -98,6 +98,7 @@ class EnvguardConfig:
     dotenv: Optional[str] = None
     exclude: List[str] = field(default_factory=list)
     supabase_project: Optional[str] = None
+    baseline: Optional[str] = None
     optional: List[str] = field(default_factory=list)
     external: List[str] = field(default_factory=list)
     ignore_missing: List[str] = field(default_factory=list)
@@ -919,6 +920,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
 
     dotenv = raw_config.get("dotenv")
     supabase_project = raw_config.get("supabase_project")
+    baseline = raw_config.get("baseline")
     exclude = raw_config.get("exclude", [])
     optional = raw_config.get("optional", [])
     external = raw_config.get("external", [])
@@ -931,6 +933,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
         dotenv=dotenv if isinstance(dotenv, str) else None,
         exclude=list_of_strings(exclude),
         supabase_project=supabase_project if isinstance(supabase_project, str) else None,
+        baseline=baseline if isinstance(baseline, str) else None,
         optional=list_of_strings(optional),
         external=list_of_strings(external),
         ignore_missing=list_of_strings(ignore_missing),
@@ -1639,6 +1642,82 @@ def analyze(
     return result
 
 
+BASELINE_VERSION = 1
+FINDING_FIELDS = (
+    "unused",
+    "missing",
+    "optional_missing",
+    "external_missing",
+    "ignored_missing",
+    "supabase_orphans",
+)
+
+
+def _result_findings(result: ScanResult) -> dict[str, list[str]]:
+    """Return only secret-safe finding key names grouped by class."""
+    return {field_name: sorted(getattr(result, field_name)) for field_name in FINDING_FIELDS}
+
+
+def load_baseline(path: Path) -> dict[str, set[str]]:
+    """Load an envguard baseline file containing finding classes and key names."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"Error: failed to read baseline {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid baseline JSON in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, dict) or data.get("version") != BASELINE_VERSION:
+        print(
+            f"Error: baseline {path} must be a version {BASELINE_VERSION} object",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    findings = data.get("findings")
+    if not isinstance(findings, dict):
+        print(f"Error: baseline {path} must contain a findings object", file=sys.stderr)
+        sys.exit(1)
+
+    baseline: dict[str, set[str]] = {}
+    for field_name in FINDING_FIELDS:
+        values = findings.get(field_name, [])
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            print(
+                f"Error: baseline {path} field {field_name!r} must be a list of key names",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        baseline[field_name] = set(values)
+    return baseline
+
+
+def write_baseline(path: Path, result: ScanResult) -> None:
+    """Write current findings to a secret-safe baseline JSON file."""
+    payload = {
+        "version": BASELINE_VERSION,
+        "findings": _result_findings(result),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def apply_baseline(result: ScanResult, baseline: dict[str, set[str]]) -> dict[str, int]:
+    """Suppress findings that are already recorded in the baseline."""
+    suppressed: dict[str, int] = {}
+    for field_name in FINDING_FIELDS:
+        values = getattr(result, field_name)
+        baselined = baseline.get(field_name, set())
+        filtered = [value for value in values if value not in baselined]
+        suppressed_count = len(values) - len(filtered)
+        setattr(result, field_name, filtered)
+        if suppressed_count:
+            suppressed[field_name] = suppressed_count
+    return suppressed
+
+
 # ─── Output Formatting ─────────────────────────────────────────────────────
 
 
@@ -1648,6 +1727,8 @@ def _rich_output(
     supabase_ref: Optional[str],
     show_details: bool = False,
     details_command: Optional[str] = None,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ):
     """Pretty terminal output using rich."""
     console = Console()
@@ -1664,6 +1745,11 @@ def _rich_output(
         summary += f"\n  • dotenv file: [green]{dotenv_path}[/]"
     if supabase_ref:
         summary += f"\n  • Supabase project: [green]{supabase_ref}[/]"
+    if baseline_path:
+        summary += f"\n  • baseline: [green]{baseline_path}[/]"
+    suppressed_total = sum((baseline_suppressed or {}).values())
+    if suppressed_total:
+        summary += f"\n  • {suppressed_total} baselined finding(s) suppressed"
     console.print(Panel(summary, border_style="cyan"))
     console.print()
 
@@ -1816,6 +1902,8 @@ def _json_summary(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> dict[str, object]:
     """Return compact metadata for JSON consumers."""
     blocking = has_blocking_issues(
@@ -1823,7 +1911,7 @@ def _json_summary(
         allow_unused=allow_unused,
         allow_missing=allow_missing,
     )
-    return {
+    summary: dict[str, object] = {
         "counts": {
             "unused": len(result.unused),
             "missing": len(result.missing),
@@ -1837,12 +1925,22 @@ def _json_summary(
         "blocking": blocking,
         "exit_code": 1 if blocking else 0,
     }
+    if baseline_path or baseline_suppressed:
+        summary["baseline"] = {
+            "path": str(baseline_path) if baseline_path else None,
+            "suppressed": {field: baseline_suppressed.get(field, 0) for field in FINDING_FIELDS}
+            if baseline_suppressed
+            else {field: 0 for field in FINDING_FIELDS},
+        }
+    return summary
 
 
 def _json_output(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> None:
     """JSON machine-readable output."""
     output = {
@@ -1850,6 +1948,8 @@ def _json_output(
             result,
             allow_unused=allow_unused,
             allow_missing=allow_missing,
+            baseline_path=baseline_path,
+            baseline_suppressed=baseline_suppressed,
         ),
         "unused": result.unused,
         "missing": result.missing,
@@ -1883,6 +1983,7 @@ def format_summary_line(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> str:
     """Return a one-line terminal summary for CI/chat consumers."""
     blocking = has_blocking_issues(
@@ -1899,9 +2000,13 @@ def format_summary_line(
         (len(result.ignored_missing), "ignored"),
         (len(result.supabase_orphans), "orphaned"),
     ]
+    actual_counts_present = any(count for count, _label in counts)
     shown_counts = [_count_phrase(count, label) for count, label in counts if count]
+    suppressed_total = sum((baseline_suppressed or {}).values())
+    if suppressed_total:
+        shown_counts.append(_count_phrase(suppressed_total, "baselined"))
     counts_text = ", ".join(shown_counts) if shown_counts else "clean"
-    status = "red" if blocking else "yellow" if shown_counts else "green"
+    status = "red" if blocking else "yellow" if actual_counts_present else "green"
     return f"envguard: {status} — {counts_text} (exit {exit_code})"
 
 
@@ -1909,6 +2014,7 @@ def _summary_output(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> None:
     """Print compact, non-rich terminal output."""
     print(
@@ -1916,6 +2022,7 @@ def _summary_output(
             result,
             allow_unused=allow_unused,
             allow_missing=allow_missing,
+            baseline_suppressed=baseline_suppressed,
         )
     )
 
@@ -2353,6 +2460,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard update                    Update envguard from GitHub\n"
             "  envguard --json                    Machine-readable output\n"
             "  envguard --summary                 One-line terminal summary\n"
+            "  envguard --baseline .envguard-baseline.json\n"
+            "                                    Suppress known findings\n"
             "  envguard --details                 Show detailed issue tables\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
@@ -2416,6 +2525,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to dotenv file (default: auto-detect .env.example/.env.sample/.env)",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="Path to an envguard baseline JSON file with known findings to suppress",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        type=str,
+        default=None,
+        help="Write current findings to a secret-safe baseline JSON file and exit",
     )
     parser.add_argument(
         "--debug",
@@ -2652,6 +2773,22 @@ def main(argv: Optional[List[str]] = None):
         ignore_keys=config.ignore_missing + args.ignore_missing,
     )
 
+    if args.write_baseline:
+        output_baseline_path = Path(args.write_baseline).resolve()
+        write_baseline(output_baseline_path, result)
+        print(f"Wrote envguard baseline to {output_baseline_path}")
+        return
+
+    baseline_path: Optional[Path] = None
+    baseline_suppressed: dict[str, int] = {}
+    if args.baseline or config.baseline:
+        baseline_path = (
+            Path(args.baseline).resolve()
+            if args.baseline
+            else _resolve_config_path(config.baseline or "", scan_path).resolve()
+        )
+        baseline_suppressed = apply_baseline(result, load_baseline(baseline_path))
+
     # ── Output ─────────────────────────────────────────────────────────────
     if args.github_annotations:
         _github_annotations_output(result)
@@ -2660,12 +2797,15 @@ def main(argv: Optional[List[str]] = None):
             result,
             allow_unused=args.allow_unused,
             allow_missing=args.allow_missing,
+            baseline_path=baseline_path,
+            baseline_suppressed=baseline_suppressed,
         )
     elif args.summary:
         _summary_output(
             result,
             allow_unused=args.allow_unused,
             allow_missing=args.allow_missing,
+            baseline_suppressed=baseline_suppressed,
         )
     else:
         if Console is None:
@@ -2674,6 +2814,8 @@ def main(argv: Optional[List[str]] = None):
                 result,
                 allow_unused=args.allow_unused,
                 allow_missing=args.allow_missing,
+                baseline_path=baseline_path,
+                baseline_suppressed=baseline_suppressed,
             )
         else:
             _rich_output(
@@ -2682,6 +2824,8 @@ def main(argv: Optional[List[str]] = None):
                 supabase_project,
                 show_details=args.details,
                 details_command=build_details_command(raw_argv),
+                baseline_path=baseline_path,
+                baseline_suppressed=baseline_suppressed,
             )
 
     # ── Interactive fix ────────────────────────────────────────────────────

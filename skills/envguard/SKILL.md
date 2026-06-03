@@ -135,6 +135,20 @@ Do not use `--fix-real-env` unless the user explicitly asks to edit a real
 `.env` file; prefer templates such as `.env.example`, `.env.sample`, or
 `.env.template`.
 
+## Baselines
+
+When a legacy project has existing drift and the user wants incremental CI
+adoption, create a secret-safe baseline instead of weakening checks globally:
+
+```bash
+envguard --no-wizard --write-baseline .envguard-baseline.json
+envguard --no-wizard --baseline .envguard-baseline.json
+```
+
+Baseline files contain finding classes and key names only. They must not contain
+dotenv values, file references, Supabase access tokens, or secret values. New
+unbaselined findings still fail according to the normal `--allow-*` rules.
+
 ## Project Defaults
 
 When the user wants repeatable envguard settings for a repository or CI, persist
