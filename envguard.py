@@ -472,6 +472,9 @@ def _zod_key_requirement(entry: str) -> tuple[str, str]:
 
 
 def _pydantic_field_requirement(line: str) -> tuple[str, str]:
+    default = line.split("=", 1)[1].strip() if "=" in line else ""
+    if re.match(r"Field\s*\(\s*(?:\.\.\.|Ellipsis)\s*(?:,|\))", default):
+        return "required", "pydantic Field(...) marks key required"
     if "=" in line:
         return "optional", "pydantic field has a default"
     return "required", ""
