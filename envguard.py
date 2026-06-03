@@ -1471,6 +1471,89 @@ def parse_dotenv_example(path: Path) -> List[str]:
 
 
 SUPABASE_API_BASE = "https://api.supabase.com"
+SUPABASE_REDACTION = "[REDACTED]"
+SUPABASE_SENSITIVE_FIELD_RE = re.compile(
+    r"(?:^|[_-])(?:"
+    r"access[_-]?token|refresh[_-]?token|auth[_-]?token|api[_-]?key|"
+    r"service[_-]?role[_-]?key|anon[_-]?key|secret[_-]?value|secret|"
+    r"password|passwd|pwd|authorization|jwt"
+    r")(?:$|[_-])",
+    re.IGNORECASE,
+)
+SUPABASE_SENSITIVE_PAIR_RE = re.compile(
+    r"(?i)((?<![A-Za-z0-9_])[\"']?(?:access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|api[_-]?key|service[_-]?role[_-]?key|anon[_-]?key|"
+    r"secret[_-]?value|password|passwd|pwd|jwt)[\"']?\s*[:=]\s*)"
+    r"([\"']?)([^\s,;}\"']+)([\"']?)"
+)
+SUPABASE_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+SUPABASE_ACCESS_TOKEN_RE = re.compile(r"\bsbp_[A-Za-z0-9_=-]{8,}\b")
+SUPABASE_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+)
+SUPABASE_PREFIXED_TOKEN_RE = re.compile(
+    r"\b(?:sk|pk|rk)_(?:live|test|secret|anon)?_?[A-Za-z0-9]{16,}\b"
+)
+
+
+def _is_supabase_sensitive_field(key: str) -> bool:
+    """Return True for response field names likely to carry secret material."""
+    return bool(SUPABASE_SENSITIVE_FIELD_RE.search(key))
+
+
+def _redact_supabase_secret_text(text: str) -> str:
+    """Redact tokens from free-form Supabase API error text."""
+
+    def redact_pair(match: re.Match[str]) -> str:
+        prefix, open_quote, _value, close_quote = match.groups()
+        quote = close_quote if open_quote and close_quote == open_quote else open_quote
+        return f"{prefix}{quote}{SUPABASE_REDACTION}{quote}"
+
+    redacted = SUPABASE_SENSITIVE_PAIR_RE.sub(redact_pair, text)
+    redacted = SUPABASE_BEARER_TOKEN_RE.sub(f"Bearer {SUPABASE_REDACTION}", redacted)
+    redacted = SUPABASE_ACCESS_TOKEN_RE.sub(SUPABASE_REDACTION, redacted)
+    redacted = SUPABASE_JWT_RE.sub(SUPABASE_REDACTION, redacted)
+    return SUPABASE_PREFIXED_TOKEN_RE.sub(SUPABASE_REDACTION, redacted)
+
+
+def _redact_supabase_error_data(data: object, sensitive_field: bool = False) -> object:
+    """Recursively redact secret values while preserving JSON response shape."""
+    if isinstance(data, dict):
+        return {
+            key: _redact_supabase_error_data(
+                value,
+                sensitive_field or _is_supabase_sensitive_field(key),
+            )
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_redact_supabase_error_data(item, sensitive_field) for item in data]
+    if sensitive_field:
+        return SUPABASE_REDACTION if data is not None else None
+    if isinstance(data, str):
+        return _redact_supabase_secret_text(data)
+    return data
+
+
+def _redact_supabase_error_body(body: str) -> str:
+    """Sanitize a Supabase API response body for safe CLI error output."""
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return _redact_supabase_secret_text(body)
+    return json.dumps(
+        _redact_supabase_error_data(data),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _format_supabase_api_error(status: int, body: str) -> str:
+    """Build a redacted Supabase API status/body error message."""
+    redacted_body = _redact_supabase_error_body(body)
+    return f"Error: Supabase API returned {status}: {redacted_body}"
 
 
 def _parse_supabase_secret_names(data: object) -> List[str]:
@@ -1523,18 +1606,18 @@ def fetch_supabase_secrets(project_ref: str, access_token: str) -> List[str]:
             },
         )
         resp = conn.getresponse()
-        body = resp.read().decode("utf-8")
+        body = resp.read().decode("utf-8", errors="replace")
         if resp.status != 200:
-            print(
-                f"Error: Supabase API returned {resp.status}: {body}",
-                file=sys.stderr,
-            )
+            print(_format_supabase_api_error(resp.status, body), file=sys.stderr)
             sys.exit(1)
 
         data = json.loads(body)
         return _parse_supabase_secret_names(data)
     except (http.client.HTTPException, OSError, json.JSONDecodeError, ValueError) as e:
-        print(f"Error: Failed to fetch Supabase secrets: {e}", file=sys.stderr)
+        print(
+            f"Error: Failed to fetch Supabase secrets: {_redact_supabase_secret_text(str(e))}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     finally:
         conn.close()
@@ -1564,16 +1647,16 @@ def delete_supabase_secrets(project_ref: str, access_token: str, names: List[str
             },
         )
         resp = conn.getresponse()
-        body = resp.read().decode("utf-8")
+        body = resp.read().decode("utf-8", errors="replace")
         if resp.status not in (200, 204):
-            print(
-                f"Error: Supabase API returned {resp.status}: {body}",
-                file=sys.stderr,
-            )
+            print(_format_supabase_api_error(resp.status, body), file=sys.stderr)
             return False
         return True
     except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
-        print(f"Error: Failed to delete Supabase secrets: {e}", file=sys.stderr)
+        print(
+            f"Error: Failed to delete Supabase secrets: {_redact_supabase_secret_text(str(e))}",
+            file=sys.stderr,
+        )
         return False
     finally:
         conn.close()
