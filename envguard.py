@@ -93,6 +93,32 @@ class ScanResult:
 
 
 @dataclass
+class SecretsMatrixRow:
+    """Availability/readiness for one referenced environment key."""
+
+    key: str
+    requirement: str
+    status: str
+    dotenv: bool
+    environment: bool
+    supabase: Optional[bool]
+    references: int
+
+
+@dataclass
+class SecretsMatrix:
+    """Doctor/matrix report that never includes secret values."""
+
+    rows: List[SecretsMatrixRow]
+    dotenv_path: Optional[Path] = None
+    supabase_project: Optional[str] = None
+    supabase_checked: bool = False
+    unused_dotenv: List[str] = field(default_factory=list)
+    supabase_orphans: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
 class EnvguardConfig:
     """Configuration loaded from [tool.envguard] in pyproject.toml."""
 
@@ -1726,6 +1752,278 @@ def analyze(
     return result
 
 
+def _requirement_for_key(
+    key: str,
+    refs: List[EnvReference],
+    optional_keys: set[str],
+    external_keys: set[str],
+    ignored_keys: set[str],
+) -> str:
+    """Classify a key using CLI/config overrides before inferred requirements."""
+    if key in ignored_keys:
+        return "ignored"
+    if key in external_keys:
+        return "external"
+    if key in optional_keys:
+        return "optional"
+
+    requirements = {ref.requirement for ref in refs}
+    if "required" in requirements:
+        return "required"
+    if "optional" in requirements:
+        return "optional"
+    if "external" in requirements:
+        return "external"
+    return "required"
+
+
+def _matrix_status(requirement: str, available: bool) -> str:
+    """Return the doctor status for a key without considering secret values."""
+    if available:
+        return "ready"
+    if requirement == "required":
+        return "missing"
+    return f"{requirement}-missing"
+
+
+def build_secrets_matrix(
+    ref_map: Dict[str, List[EnvReference]],
+    dotenv_keys: List[str],
+    env: Mapping[str, str],
+    supabase_keys: Optional[List[str]] = None,
+    optional_keys: Optional[List[str]] = None,
+    external_keys: Optional[List[str]] = None,
+    ignore_keys: Optional[List[str]] = None,
+    dotenv_path: Optional[Path] = None,
+    supabase_project: Optional[str] = None,
+    notes: Optional[List[str]] = None,
+) -> SecretsMatrix:
+    """Build a secret-readiness matrix without reading or exposing values."""
+    dotenv_set = set(dotenv_keys)
+    env_set = set(env.keys())
+    supabase_set = set(supabase_keys or [])
+    supabase_checked = supabase_keys is not None
+    optional_set = set(optional_keys or [])
+    external_set = set(external_keys or [])
+    ignored_set = set(ignore_keys or [])
+
+    rows: List[SecretsMatrixRow] = []
+    for key in sorted(ref_map):
+        refs = ref_map[key]
+        in_dotenv = key in dotenv_set
+        in_env = key in env_set
+        in_supabase = key in supabase_set if supabase_checked else None
+        available = in_dotenv or in_env or bool(in_supabase)
+        requirement = _requirement_for_key(
+            key,
+            refs,
+            optional_set,
+            external_set,
+            ignored_set,
+        )
+        rows.append(
+            SecretsMatrixRow(
+                key=key,
+                requirement=requirement,
+                status=_matrix_status(requirement, available),
+                dotenv=in_dotenv,
+                environment=in_env,
+                supabase=in_supabase,
+                references=len(refs),
+            )
+        )
+
+    return SecretsMatrix(
+        rows=rows,
+        dotenv_path=dotenv_path,
+        supabase_project=supabase_project,
+        supabase_checked=supabase_checked,
+        unused_dotenv=sorted(dotenv_set - set(ref_map)),
+        supabase_orphans=(
+            sorted(supabase_set - set(ref_map) - dotenv_set) if supabase_checked else []
+        ),
+        notes=list(notes or []),
+    )
+
+
+def _matrix_counts(matrix: SecretsMatrix) -> dict[str, int]:
+    counts = {
+        "required": 0,
+        "optional": 0,
+        "external": 0,
+        "ignored": 0,
+        "ready": 0,
+        "missing": 0,
+        "optional_missing": 0,
+        "external_missing": 0,
+        "ignored_missing": 0,
+        "unused_dotenv": len(matrix.unused_dotenv),
+        "supabase_orphans": len(matrix.supabase_orphans),
+    }
+    for row in matrix.rows:
+        counts[row.requirement] += 1
+        if row.status == "ready":
+            counts["ready"] += 1
+        else:
+            normalized = row.status.replace("-", "_")
+            counts[normalized] += 1
+    return counts
+
+
+def secrets_matrix_has_required_missing(matrix: SecretsMatrix) -> bool:
+    """Return whether the doctor found required keys missing from every source."""
+    return any(row.status == "missing" for row in matrix.rows)
+
+
+def _availability_marker(value: Optional[bool]) -> str:
+    if value is None:
+        return "not checked"
+    return "yes" if value else "no"
+
+
+def _matrix_json_output(matrix: SecretsMatrix) -> None:
+    output = {
+        "summary": {
+            "counts": _matrix_counts(matrix),
+            "blocking": secrets_matrix_has_required_missing(matrix),
+            "exit_code": 1 if secrets_matrix_has_required_missing(matrix) else 0,
+        },
+        "sources": {
+            "dotenv": str(matrix.dotenv_path) if matrix.dotenv_path else None,
+            "environment": "current process",
+            "supabase_project": matrix.supabase_project,
+            "supabase_checked": matrix.supabase_checked,
+        },
+        "notes": matrix.notes,
+        "rows": [
+            {
+                "key": row.key,
+                "requirement": row.requirement,
+                "status": row.status,
+                "available": {
+                    "dotenv": row.dotenv,
+                    "environment": row.environment,
+                    "supabase": row.supabase,
+                },
+                "references": row.references,
+            }
+            for row in matrix.rows
+        ],
+        "unused_dotenv": matrix.unused_dotenv,
+        "supabase_orphans": matrix.supabase_orphans,
+    }
+    print(json.dumps(output, indent=2))
+
+
+def _matrix_plain_output(matrix: SecretsMatrix) -> None:
+    counts = _matrix_counts(matrix)
+    print("envguard doctor — secret readiness matrix")
+    print(f"dotenv: {matrix.dotenv_path if matrix.dotenv_path else 'not found'}")
+    if matrix.supabase_project:
+        checked = "checked" if matrix.supabase_checked else "not checked"
+        print(f"supabase: {matrix.supabase_project} ({checked})")
+    else:
+        print("supabase: not configured")
+    print("values: hidden")
+    print()
+    print("key\trequirement\tstatus\tdotenv\tenv\tsupabase\trefs")
+    for row in matrix.rows:
+        print(
+            f"{row.key}\t{row.requirement}\t{row.status}\t"
+            f"{_availability_marker(row.dotenv)}\t"
+            f"{_availability_marker(row.environment)}\t"
+            f"{_availability_marker(row.supabase)}\t{row.references}"
+        )
+    print()
+    print(
+        "summary: "
+        f"{counts['ready']} ready, {counts['missing']} required missing, "
+        f"{counts['optional_missing']} optional missing, "
+        f"{counts['external_missing']} external missing, "
+        f"{counts['ignored_missing']} ignored missing"
+    )
+    if matrix.unused_dotenv:
+        print(f"unused dotenv keys: {', '.join(matrix.unused_dotenv)}")
+    if matrix.supabase_orphans:
+        print(f"orphaned Supabase secrets: {', '.join(matrix.supabase_orphans)}")
+    for note in matrix.notes:
+        print(f"note: {note}")
+
+
+def _matrix_rich_output(matrix: SecretsMatrix) -> None:
+    assert Console is not None
+    assert Table is not None
+    assert Panel is not None
+    console = Console()
+    counts = _matrix_counts(matrix)
+    summary = "[bold cyan]envguard doctor[/] — Secret Readiness Matrix\n"
+    summary += "  • Values are hidden; only key names and source availability are shown"
+    if matrix.dotenv_path:
+        summary += f"\n  • dotenv: [green]{matrix.dotenv_path}[/]"
+    else:
+        summary += "\n  • dotenv: [yellow]not found[/]"
+    if matrix.supabase_project:
+        checked = "checked" if matrix.supabase_checked else "not checked"
+        summary += f"\n  • Supabase project: [green]{matrix.supabase_project}[/] ({checked})"
+    else:
+        summary += "\n  • Supabase project: [dim]not configured[/]"
+    console.print()
+    console.print(Panel(summary, border_style="cyan"))
+    console.print()
+
+    table = Table(title="Key readiness", border_style="cyan")
+    table.add_column("Key", no_wrap=True)
+    table.add_column("Requirement")
+    table.add_column("Status")
+    table.add_column("dotenv")
+    table.add_column("env")
+    table.add_column("Supabase")
+    table.add_column("Refs", justify="right")
+    for row in matrix.rows:
+        if row.status == "ready":
+            status_style = "green"
+        elif row.status == "missing":
+            status_style = "red"
+        else:
+            status_style = "yellow"
+        table.add_row(
+            row.key,
+            row.requirement,
+            f"[{status_style}]{row.status}[/]",
+            _availability_marker(row.dotenv),
+            _availability_marker(row.environment),
+            _availability_marker(row.supabase),
+            str(row.references),
+        )
+    console.print(table)
+    console.print()
+    console.print(
+        "[bold]Summary:[/] "
+        f"{counts['ready']} ready, {counts['missing']} required missing, "
+        f"{counts['optional_missing']} optional missing, "
+        f"{counts['external_missing']} external missing, "
+        f"{counts['ignored_missing']} ignored missing"
+    )
+    if matrix.unused_dotenv:
+        console.print(f"[yellow]Unused dotenv keys:[/] {', '.join(matrix.unused_dotenv)}")
+    if matrix.supabase_orphans:
+        console.print(
+            f"[magenta]Orphaned Supabase secrets:[/] {', '.join(matrix.supabase_orphans)}"
+        )
+    for note in matrix.notes:
+        console.print(f"[dim]Note:[/] {note}")
+    console.print()
+
+
+def _matrix_output(matrix: SecretsMatrix, json_output: bool = False) -> None:
+    if json_output:
+        _matrix_json_output(matrix)
+    elif Console is None:
+        _matrix_plain_output(matrix)
+    else:
+        _matrix_rich_output(matrix)
+
+
 BASELINE_VERSION = 1
 FINDING_FIELDS = (
     "unused",
@@ -2630,6 +2928,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard                          Guided audit on interactive terminals\n"
             "  envguard wizard                   Build the right command interactively\n"
             "  envguard apps/web                  Scan a specific project\n"
+            "  envguard doctor                    Show secret readiness matrix\n"
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard ci-template               Print a GitHub Actions workflow\n"
             "  envguard supabase xyz              Compare with Supabase secrets\n"
@@ -2649,7 +2948,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help=(
             "Optional project path or preset: wizard, ci, ci-template, "
-            "supabase <project-ref>, init, update"
+            "doctor, matrix, supabase <project-ref>, init, update"
         ),
     )
     parser.add_argument(
@@ -2789,6 +3088,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                 parser.error("ci accepts at most one project path")
             if len(tokens) == 2:
                 args.path = tokens[1]
+        elif first in {"doctor", "matrix"}:
+            args.command = "doctor"
+            if len(tokens) > 2:
+                parser.error(f"{first} accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
         elif first == "ci-template":
             args.command = "ci-template"
             if len(tokens) > 2:
@@ -2885,6 +3190,7 @@ def main(argv: Optional[List[str]] = None):
     )
     token_info = detect_supabase_access_token(scan_path, dotenv_path, os.environ)
     supabase_access_token = token_info[0] if token_info else None
+    doctor_notes: List[str] = []
 
     # ── Scan codebase ──────────────────────────────────────────────────────
     ref_map = scan_directory(scan_path, exclude_patterns=exclude_patterns)
@@ -2910,7 +3216,7 @@ def main(argv: Optional[List[str]] = None):
     supabase_keys: Optional[List[str]] = None
     if supabase_project:
         if not supabase_access_token:
-            if explicit_supabase_project:
+            if explicit_supabase_project and args.command != "doctor":
                 print(
                     "Error: SUPABASE_ACCESS_TOKEN environment variable is required "
                     "when using --supabase-project. You can also place it in .env "
@@ -2918,6 +3224,10 @@ def main(argv: Optional[List[str]] = None):
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            doctor_notes.append(
+                "Supabase project detected, but SUPABASE_ACCESS_TOKEN was not available; "
+                "Supabase availability was not checked."
+            )
             if args.debug and has_supabase_edge_functions(scan_path):
                 print(
                     "[debug] Supabase project detected, but SUPABASE_ACCESS_TOKEN "
@@ -2939,6 +3249,24 @@ def main(argv: Optional[List[str]] = None):
         if args.debug and supabase_keys is not None:
             print(f"[debug] Supabase secrets ({len(supabase_keys)}): {supabase_keys}")
             print()
+
+    if args.command == "doctor":
+        matrix = build_secrets_matrix(
+            ref_map,
+            dotenv_keys,
+            os.environ,
+            supabase_keys,
+            optional_keys=config.optional + args.optional,
+            external_keys=config.external + args.external,
+            ignore_keys=config.ignore_missing + args.ignore_missing,
+            dotenv_path=dotenv_path if dotenv_path.exists() else None,
+            supabase_project=supabase_project,
+            notes=doctor_notes,
+        )
+        _matrix_output(matrix, json_output=args.json)
+        if secrets_matrix_has_required_missing(matrix) and not args.allow_missing:
+            sys.exit(1)
+        return
 
     # ── Analyze ────────────────────────────────────────────────────────────
     result = analyze(

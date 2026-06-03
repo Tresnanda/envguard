@@ -127,6 +127,15 @@ envguard --summary
 # envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
 ```
 
+Inspect secret readiness across dotenv, the current shell environment, and Supabase secret names without printing any values:
+
+```bash
+envguard doctor
+envguard matrix apps/web --json
+```
+
+The doctor/matrix command is opt-in and reports one row per referenced key with its requirement class (`required`, `optional`, `external`, or `ignored`), whether the key name is present in the selected dotenv file, the current process environment, and fetched Supabase secrets, plus a readiness status. It never prints dotenv values, shell environment values, Supabase token values, or Supabase secret values. It exits non-zero when a required key is missing from all checked sources unless `--allow-missing` is used.
+
 Create a baseline for existing drift, then fail only on new findings:
 
 ```bash
@@ -324,11 +333,13 @@ usage: envguard [-h] [--path PATH] [--json] [--summary]
                 [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
                 [--allow-unused] [--allow-missing] [--no-wizard]
-                [path|wizard|ci|ci-template|supabase|init|update] [...]
+                [path|wizard|doctor|matrix|ci|ci-template|supabase|init|update] [...]
 
 options:
   path                  Optional project path, e.g. envguard apps/web.
   wizard                Build and optionally run an audit command interactively.
+  doctor [path]         Show key readiness across dotenv/env/Supabase sources.
+  matrix [path]         Alias for doctor.
   ci [path]             Shortcut for GitHub Actions annotations.
   ci-template [path]    Print a copy-pasteable GitHub Actions workflow.
   supabase ID [path]    Shortcut for Supabase secret comparison.
