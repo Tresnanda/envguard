@@ -136,6 +136,13 @@ envguard matrix apps/web --json
 
 The doctor/matrix command is opt-in and reports one row per referenced key with its requirement class (`required`, `optional`, `external`, or `ignored`), whether the key name is present in the selected dotenv file, the current process environment, and fetched Supabase secrets, plus a readiness status. It never prints dotenv values, shell environment values, Supabase token values, or Supabase secret values. It exits non-zero when a required key is missing from all checked sources unless `--allow-missing` is used.
 
+Create a baseline for existing drift, then fail only on new findings:
+
+```bash
+envguard --write-baseline .envguard-baseline.json
+envguard --baseline .envguard-baseline.json
+```
+
 Emit GitHub Actions annotations in CI logs:
 
 ```bash
@@ -318,9 +325,12 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 
 ```text
 usage: envguard [-h] [--path PATH] [--json] [--summary]
-                [--github-annotations] [--fix]
+                [--github-annotations] [--fix] [--fix-dry-run]
+                [--fix-real-env]
                 [--supabase-project SUPABASE_PROJECT]
-                [--dotenv DOTENV] [--debug] [--details] [--exclude PATTERN]
+                [--dotenv DOTENV] [--baseline BASELINE]
+                [--write-baseline WRITE_BASELINE] [--debug] [--details]
+                [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
                 [--allow-unused] [--allow-missing] [--no-wizard]
                 [path|wizard|doctor|matrix|ci|ci-template|supabase|init|update] [...]
@@ -341,8 +351,12 @@ options:
   --summary             Print one compact terminal summary line.
   --github-annotations  Print GitHub Actions annotations for CI logs.
   --fix                 Interactively remove unused keys from .env.example.
+  --fix-dry-run         Preview unused dotenv entries that --fix would prune without writing files.
+  --fix-real-env        Allow --fix to edit a real .env file instead of only templates.
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
   --dotenv PATH         Path to dotenv example file. Defaults to <path>/.env.example.
+  --baseline PATH       Suppress known findings listed in an envguard baseline JSON file.
+  --write-baseline PATH Write current findings to a secret-safe baseline JSON file and exit.
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
   --optional KEY        Mark a missing key as optional/defaulted. Can be repeated.
   --external KEY        Mark a missing key as owned by another runtime/container. Can be repeated.
@@ -363,6 +377,44 @@ envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
 ```
 
 The status is `red` when blocking findings would make envguard exit non-zero, `yellow` when findings are present but allowed/advisory, and `green` when the scan is clean. Counts include nonzero `missing`, `unused`, `optional`, `external`, `ignored`, and Supabase `orphaned` findings.
+
+## Baselines
+
+Baselines let legacy projects adopt envguard incrementally. Write the current
+findings once, commit the generated JSON, and keep CI strict for any new drift:
+
+```bash
+envguard --write-baseline .envguard-baseline.json
+envguard --baseline .envguard-baseline.json
+```
+
+Baseline files store only finding classes and key names — no dotenv values,
+reference paths, Supabase tokens, or secret values:
+
+```json
+{
+  "version": 1,
+  "findings": {
+    "unused": ["OLD_API_KEY"],
+    "missing": ["DATABASE_URL"],
+    "optional_missing": [],
+    "external_missing": [],
+    "ignored_missing": [],
+    "supabase_orphans": []
+  }
+}
+```
+
+You can also store the path in project config:
+
+```toml
+[tool.envguard]
+baseline = ".envguard-baseline.json"
+```
+
+Matching findings are suppressed before output and exit-code calculation. New
+unbaselined `MISSING`, `UNUSED`, or `ORPHANED` findings still fail unless you
+also pass the existing `--allow-*` flags.
 
 ## JSON Output
 

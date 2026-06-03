@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -176,6 +177,30 @@ def test_detect_references_finds_zod_process_env_schema_keys(tmp_path: Path) -> 
     assert {ref.pattern_type for ref in refs} == {"zod process.env schema"}
 
 
+def test_pydantic_field_ellipsis_stays_required(tmp_path: Path) -> None:
+    source = tmp_path / "settings.py"
+    source.write_text(
+        "\n".join(
+            [
+                "from pydantic import Field",
+                "from pydantic_settings import BaseSettings",
+                "",
+                "class Settings(BaseSettings):",
+                "    api_key: str = Field(...)",
+                "    token: str = Field(Ellipsis, description='required')",
+                "    timeout: int = 30",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = {ref.key: ref for ref in envguard.detect_references(source)}
+
+    assert refs["API_KEY"].pattern_type == "pydantic BaseSettings"
+    assert refs["API_KEY"].requirement == "required"
+    assert refs["API_KEY"].reason == "pydantic Field(...) marks key required"
+    assert refs["TOKEN"].requirement == "required"
+    assert refs["TIMEOUT"].requirement == "optional"
 
 
 def test_zod_process_env_schema_detection_ignores_unrelated_schemas(
@@ -455,6 +480,100 @@ def test_fetch_supabase_secrets_reports_invalid_json(
     assert "Expecting property name enclosed in double quotes" in err
 
 
+def test_fetch_supabase_secrets_redacts_json_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api_token = "sbp_request_token_123456789"
+    body_token = "sbp_response_token_123456789"
+    body_api_key = "sk_test_abcdefghijklmnopqrstuvwxyz"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {
+            "error": "unauthorized",
+            "message": f"invalid bearer token Bearer {body_token}",
+            "access_token": api_token,
+            "details": {
+                "api_key": body_api_key,
+                "request_id": "req_12345",
+            },
+        },
+        status=401,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", api_token)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Supabase API returned 401" in err
+    assert '"error":"unauthorized"' in err
+    assert '"message":"invalid bearer token Bearer [REDACTED]"' in err
+    assert '"access_token":"[REDACTED]"' in err
+    assert '"api_key":"[REDACTED]"' in err
+    assert '"request_id":"req_12345"' in err
+    assert api_token not in err
+    assert body_token not in err
+    assert body_api_key not in err
+
+
+def test_fetch_supabase_secrets_redacts_malformed_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_token = "sbp_raw_response_token_123456789"
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signatureX"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        f"not json: access_token={raw_token}; Authorization: Bearer {jwt}",
+        status=500,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.fetch_supabase_secrets("project-ref", raw_token)
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "Supabase API returned 500" in err
+    assert "access_token=[REDACTED]" in err
+    assert "Authorization: Bearer [REDACTED]" in err
+    assert raw_token not in err
+    assert jwt not in err
+
+
+def test_delete_supabase_secrets_redacts_api_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    leaked_secret = "sbp_delete_response_token_123456789"
+    leaked_password = "correct-horse-battery-staple"
+    _mock_supabase_secrets_response(
+        monkeypatch,
+        {
+            "error": "delete_failed",
+            "message": "secret cannot be deleted",
+            "secret_value": leaked_secret,
+            "password": leaked_password,
+        },
+        status=403,
+    )
+
+    assert not envguard.delete_supabase_secrets(
+        "project-ref",
+        "sbp_request_token_123456789",
+        ["OLD_SECRET"],
+    )
+
+    err = capsys.readouterr().err
+    assert "Supabase API returned 403" in err
+    assert '"error":"delete_failed"' in err
+    assert '"message":"secret cannot be deleted"' in err
+    assert '"secret_value":"[REDACTED]"' in err
+    assert '"password":"[REDACTED]"' in err
+    assert leaked_secret not in err
+    assert leaked_password not in err
+
+
 def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     ref_map = {
         "DATABASE_URL": [
@@ -580,6 +699,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'dotenv = "config/example.env"',
                 'exclude = ["fixtures/**", "snapshots/**"]',
                 'supabase_project = "abcd1234"',
+                'baseline = ".envguard-baseline.json"',
                 'optional = ["CLI_DEFAULT_BOT"]',
                 'external = ["REMOTE_CONTAINER_SECRET"]',
                 'ignore_missing = ["LEGACY_FLAG"]',
@@ -593,6 +713,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.dotenv == "config/example.env"
     assert config.exclude == ["fixtures/**", "snapshots/**"]
     assert config.supabase_project == "abcd1234"
+    assert config.baseline == ".envguard-baseline.json"
     assert config.optional == ["CLI_DEFAULT_BOT"]
     assert config.external == ["REMOTE_CONTAINER_SECRET"]
     assert config.ignore_missing == ["LEGACY_FLAG"]
@@ -780,6 +901,75 @@ def test_allow_flags_control_blocking_issue_detection() -> None:
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
 
 
+def test_baseline_suppresses_known_findings_and_keeps_new_ones() -> None:
+    result = envguard.ScanResult(
+        unused=["OLD_KEY", "NEW_UNUSED"],
+        missing=["KNOWN_MISSING", "NEW_MISSING"],
+        optional_missing=["KNOWN_OPTIONAL"],
+        supabase_orphans=["KNOWN_ORPHAN"],
+    )
+
+    suppressed = envguard.apply_baseline(
+        result,
+        {
+            "unused": {"OLD_KEY"},
+            "missing": {"KNOWN_MISSING"},
+            "optional_missing": {"KNOWN_OPTIONAL"},
+            "external_missing": set(),
+            "ignored_missing": set(),
+            "supabase_orphans": {"KNOWN_ORPHAN"},
+        },
+    )
+
+    assert result.unused == ["NEW_UNUSED"]
+    assert result.missing == ["NEW_MISSING"]
+    assert result.optional_missing == []
+    assert result.supabase_orphans == []
+    assert suppressed == {
+        "unused": 1,
+        "missing": 1,
+        "optional_missing": 1,
+        "supabase_orphans": 1,
+    }
+    assert envguard.has_blocking_issues(result)
+
+
+def test_write_and_load_baseline_store_only_key_names(tmp_path: Path) -> None:
+    baseline_path = tmp_path / ".envguard-baseline.json"
+    result = envguard.ScanResult(
+        references={
+            "DATABASE_URL": [
+                envguard.EnvReference(
+                    key="DATABASE_URL",
+                    file="/repo/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        unused=["OLD_KEY"],
+        missing=["DATABASE_URL"],
+    )
+
+    envguard.write_baseline(baseline_path, result)
+
+    raw = baseline_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload == {
+        "version": 1,
+        "findings": {
+            "external_missing": [],
+            "ignored_missing": [],
+            "missing": ["DATABASE_URL"],
+            "optional_missing": [],
+            "supabase_orphans": [],
+            "unused": ["OLD_KEY"],
+        },
+    }
+    assert "/repo/app.py" not in raw
+    assert envguard.load_baseline(baseline_path)["missing"] == {"DATABASE_URL"}
+
+
 def test_json_output_includes_summary_metadata(capsys) -> None:
     result = envguard.ScanResult(
         references={
@@ -842,6 +1032,40 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_json_output_includes_baseline_suppression_metadata(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    result = envguard.ScanResult(unused=["NEW_KEY"])
+    baseline_path = tmp_path / ".envguard-baseline.json"
+
+    envguard._json_output(
+        result,
+        baseline_path=baseline_path,
+        baseline_suppressed={"missing": 2},
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["summary"]["baseline"] == {
+        "path": str(baseline_path),
+        "suppressed": {
+            "unused": 0,
+            "missing": 2,
+            "optional_missing": 0,
+            "external_missing": 0,
+            "ignored_missing": 0,
+            "supabase_orphans": 0,
+        },
+    }
+
+
+def test_summary_output_includes_baselined_findings() -> None:
+    assert envguard.format_summary_line(
+        envguard.ScanResult(),
+        baseline_suppressed={"missing": 1, "unused": 1},
+    ) == "envguard: green — 2 baselined (exit 0)"
+
+
 def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
     result = envguard.ScanResult(
         unused=["OLD_KEY"],
@@ -902,6 +1126,17 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     summary = envguard.parse_cli_args(["--summary", "apps/web"])
     assert summary.summary is True
     assert summary.path == "apps/web"
+
+    baseline = envguard.parse_cli_args([
+        "--baseline",
+        ".envguard-baseline.json",
+        "--write-baseline",
+        "baseline.json",
+        "apps/web",
+    ])
+    assert baseline.baseline == ".envguard-baseline.json"
+    assert baseline.write_baseline == "baseline.json"
+    assert baseline.path == "apps/web"
 
 
 def test_build_secrets_matrix_reports_sources_and_requirements_without_values(
@@ -1552,3 +1787,53 @@ def test_interactive_fix_does_not_follow_dotenv_symlink(
     assert target.read_text(encoding="utf-8") == original
     assert not (tmp_path / ".env.example.bak").exists()
     assert "Refusing to prune a symlinked dotenv file" in capsys.readouterr().err
+
+
+def test_interactive_fix_atomic_write_replaces_swapped_symlink_not_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+    malicious_target = tmp_path / "outside-target"
+    target_original = "DO_NOT_CHANGE=1\n"
+    malicious_target.write_text(target_original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+    real_backup = envguard._write_backup_exclusive
+
+    def backup_then_swap(path: Path, content: str) -> Path:
+        backup_path = real_backup(path, content)
+        path.unlink()
+        path.symlink_to(malicious_target)
+        return backup_path
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(envguard, "_write_backup_exclusive", backup_then_swap)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert malicious_target.read_text(encoding="utf-8") == target_original
+    assert not dotenv.is_symlink()
+    assert dotenv.read_text(encoding="utf-8") == "KEEP_ME=1\n"
+    assert (tmp_path / ".env.example.bak").read_text(encoding="utf-8") == original
+
+
+def test_atomic_write_no_follow_keeps_original_when_replace_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "OLD_SECRET=\nKEEP_ME=1\n"
+    dotenv.write_text(original, encoding="utf-8")
+
+    def fail_replace(src: os.PathLike[str], dst: os.PathLike[str]) -> None:
+        raise OSError(f"simulated replace failure: {src} -> {dst}")
+
+    monkeypatch.setattr(envguard.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        envguard._atomic_write_no_follow(dotenv, "KEEP_ME=1\n", 0o600)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".*.envguard-*.tmp")) == []

@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -124,6 +125,7 @@ class EnvguardConfig:
     dotenv: Optional[str] = None
     exclude: List[str] = field(default_factory=list)
     supabase_project: Optional[str] = None
+    baseline: Optional[str] = None
     optional: List[str] = field(default_factory=list)
     external: List[str] = field(default_factory=list)
     ignore_missing: List[str] = field(default_factory=list)
@@ -497,6 +499,9 @@ def _zod_key_requirement(entry: str) -> tuple[str, str]:
 
 
 def _pydantic_field_requirement(line: str) -> tuple[str, str]:
+    default = line.split("=", 1)[1].strip() if "=" in line else ""
+    if re.match(r"Field\s*\(\s*(?:\.\.\.|Ellipsis)\s*(?:,|\))", default):
+        return "required", "pydantic Field(...) marks key required"
     if "=" in line:
         return "optional", "pydantic field has a default"
     return "required", ""
@@ -942,6 +947,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
 
     dotenv = raw_config.get("dotenv")
     supabase_project = raw_config.get("supabase_project")
+    baseline = raw_config.get("baseline")
     exclude = raw_config.get("exclude", [])
     optional = raw_config.get("optional", [])
     external = raw_config.get("external", [])
@@ -954,6 +960,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
         dotenv=dotenv if isinstance(dotenv, str) else None,
         exclude=list_of_strings(exclude),
         supabase_project=supabase_project if isinstance(supabase_project, str) else None,
+        baseline=baseline if isinstance(baseline, str) else None,
         optional=list_of_strings(optional),
         external=list_of_strings(external),
         ignore_missing=list_of_strings(ignore_missing),
@@ -1497,6 +1504,89 @@ def parse_dotenv_example(path: Path) -> List[str]:
 
 
 SUPABASE_API_BASE = "https://api.supabase.com"
+SUPABASE_REDACTION = "[REDACTED]"
+SUPABASE_SENSITIVE_FIELD_RE = re.compile(
+    r"(?:^|[_-])(?:"
+    r"access[_-]?token|refresh[_-]?token|auth[_-]?token|api[_-]?key|"
+    r"service[_-]?role[_-]?key|anon[_-]?key|secret[_-]?value|secret|"
+    r"password|passwd|pwd|authorization|jwt"
+    r")(?:$|[_-])",
+    re.IGNORECASE,
+)
+SUPABASE_SENSITIVE_PAIR_RE = re.compile(
+    r"(?i)((?<![A-Za-z0-9_])[\"']?(?:access[_-]?token|refresh[_-]?token|"
+    r"auth[_-]?token|api[_-]?key|service[_-]?role[_-]?key|anon[_-]?key|"
+    r"secret[_-]?value|password|passwd|pwd|jwt)[\"']?\s*[:=]\s*)"
+    r"([\"']?)([^\s,;}\"']+)([\"']?)"
+)
+SUPABASE_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+SUPABASE_ACCESS_TOKEN_RE = re.compile(r"\bsbp_[A-Za-z0-9_=-]{8,}\b")
+SUPABASE_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+)
+SUPABASE_PREFIXED_TOKEN_RE = re.compile(
+    r"\b(?:sk|pk|rk)_(?:live|test|secret|anon)?_?[A-Za-z0-9]{16,}\b"
+)
+
+
+def _is_supabase_sensitive_field(key: str) -> bool:
+    """Return True for response field names likely to carry secret material."""
+    return bool(SUPABASE_SENSITIVE_FIELD_RE.search(key))
+
+
+def _redact_supabase_secret_text(text: str) -> str:
+    """Redact tokens from free-form Supabase API error text."""
+
+    def redact_pair(match: re.Match[str]) -> str:
+        prefix, open_quote, _value, close_quote = match.groups()
+        quote = close_quote if open_quote and close_quote == open_quote else open_quote
+        return f"{prefix}{quote}{SUPABASE_REDACTION}{quote}"
+
+    redacted = SUPABASE_SENSITIVE_PAIR_RE.sub(redact_pair, text)
+    redacted = SUPABASE_BEARER_TOKEN_RE.sub(f"Bearer {SUPABASE_REDACTION}", redacted)
+    redacted = SUPABASE_ACCESS_TOKEN_RE.sub(SUPABASE_REDACTION, redacted)
+    redacted = SUPABASE_JWT_RE.sub(SUPABASE_REDACTION, redacted)
+    return SUPABASE_PREFIXED_TOKEN_RE.sub(SUPABASE_REDACTION, redacted)
+
+
+def _redact_supabase_error_data(data: object, sensitive_field: bool = False) -> object:
+    """Recursively redact secret values while preserving JSON response shape."""
+    if isinstance(data, dict):
+        return {
+            key: _redact_supabase_error_data(
+                value,
+                sensitive_field or _is_supabase_sensitive_field(key),
+            )
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_redact_supabase_error_data(item, sensitive_field) for item in data]
+    if sensitive_field:
+        return SUPABASE_REDACTION if data is not None else None
+    if isinstance(data, str):
+        return _redact_supabase_secret_text(data)
+    return data
+
+
+def _redact_supabase_error_body(body: str) -> str:
+    """Sanitize a Supabase API response body for safe CLI error output."""
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return _redact_supabase_secret_text(body)
+    return json.dumps(
+        _redact_supabase_error_data(data),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _format_supabase_api_error(status: int, body: str) -> str:
+    """Build a redacted Supabase API status/body error message."""
+    redacted_body = _redact_supabase_error_body(body)
+    return f"Error: Supabase API returned {status}: {redacted_body}"
 
 
 def _parse_supabase_secret_names(data: object) -> List[str]:
@@ -1549,18 +1639,18 @@ def fetch_supabase_secrets(project_ref: str, access_token: str) -> List[str]:
             },
         )
         resp = conn.getresponse()
-        body = resp.read().decode("utf-8")
+        body = resp.read().decode("utf-8", errors="replace")
         if resp.status != 200:
-            print(
-                f"Error: Supabase API returned {resp.status}: {body}",
-                file=sys.stderr,
-            )
+            print(_format_supabase_api_error(resp.status, body), file=sys.stderr)
             sys.exit(1)
 
         data = json.loads(body)
         return _parse_supabase_secret_names(data)
     except (http.client.HTTPException, OSError, json.JSONDecodeError, ValueError) as e:
-        print(f"Error: Failed to fetch Supabase secrets: {e}", file=sys.stderr)
+        print(
+            f"Error: Failed to fetch Supabase secrets: {_redact_supabase_secret_text(str(e))}",
+            file=sys.stderr,
+        )
         sys.exit(1)
     finally:
         conn.close()
@@ -1590,16 +1680,16 @@ def delete_supabase_secrets(project_ref: str, access_token: str, names: List[str
             },
         )
         resp = conn.getresponse()
-        body = resp.read().decode("utf-8")
+        body = resp.read().decode("utf-8", errors="replace")
         if resp.status not in (200, 204):
-            print(
-                f"Error: Supabase API returned {resp.status}: {body}",
-                file=sys.stderr,
-            )
+            print(_format_supabase_api_error(resp.status, body), file=sys.stderr)
             return False
         return True
     except (http.client.HTTPException, OSError, json.JSONDecodeError) as e:
-        print(f"Error: Failed to delete Supabase secrets: {e}", file=sys.stderr)
+        print(
+            f"Error: Failed to delete Supabase secrets: {_redact_supabase_secret_text(str(e))}",
+            file=sys.stderr,
+        )
         return False
     finally:
         conn.close()
@@ -1934,6 +2024,82 @@ def _matrix_output(matrix: SecretsMatrix, json_output: bool = False) -> None:
         _matrix_rich_output(matrix)
 
 
+BASELINE_VERSION = 1
+FINDING_FIELDS = (
+    "unused",
+    "missing",
+    "optional_missing",
+    "external_missing",
+    "ignored_missing",
+    "supabase_orphans",
+)
+
+
+def _result_findings(result: ScanResult) -> dict[str, list[str]]:
+    """Return only secret-safe finding key names grouped by class."""
+    return {field_name: sorted(getattr(result, field_name)) for field_name in FINDING_FIELDS}
+
+
+def load_baseline(path: Path) -> dict[str, set[str]]:
+    """Load an envguard baseline file containing finding classes and key names."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"Error: failed to read baseline {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid baseline JSON in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, dict) or data.get("version") != BASELINE_VERSION:
+        print(
+            f"Error: baseline {path} must be a version {BASELINE_VERSION} object",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    findings = data.get("findings")
+    if not isinstance(findings, dict):
+        print(f"Error: baseline {path} must contain a findings object", file=sys.stderr)
+        sys.exit(1)
+
+    baseline: dict[str, set[str]] = {}
+    for field_name in FINDING_FIELDS:
+        values = findings.get(field_name, [])
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            print(
+                f"Error: baseline {path} field {field_name!r} must be a list of key names",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        baseline[field_name] = set(values)
+    return baseline
+
+
+def write_baseline(path: Path, result: ScanResult) -> None:
+    """Write current findings to a secret-safe baseline JSON file."""
+    payload = {
+        "version": BASELINE_VERSION,
+        "findings": _result_findings(result),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def apply_baseline(result: ScanResult, baseline: dict[str, set[str]]) -> dict[str, int]:
+    """Suppress findings that are already recorded in the baseline."""
+    suppressed: dict[str, int] = {}
+    for field_name in FINDING_FIELDS:
+        values = getattr(result, field_name)
+        baselined = baseline.get(field_name, set())
+        filtered = [value for value in values if value not in baselined]
+        suppressed_count = len(values) - len(filtered)
+        setattr(result, field_name, filtered)
+        if suppressed_count:
+            suppressed[field_name] = suppressed_count
+    return suppressed
+
+
 # ─── Output Formatting ─────────────────────────────────────────────────────
 
 
@@ -1943,6 +2109,8 @@ def _rich_output(
     supabase_ref: Optional[str],
     show_details: bool = False,
     details_command: Optional[str] = None,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ):
     """Pretty terminal output using rich."""
     console = Console()
@@ -1959,6 +2127,11 @@ def _rich_output(
         summary += f"\n  • dotenv file: [green]{dotenv_path}[/]"
     if supabase_ref:
         summary += f"\n  • Supabase project: [green]{supabase_ref}[/]"
+    if baseline_path:
+        summary += f"\n  • baseline: [green]{baseline_path}[/]"
+    suppressed_total = sum((baseline_suppressed or {}).values())
+    if suppressed_total:
+        summary += f"\n  • {suppressed_total} baselined finding(s) suppressed"
     console.print(Panel(summary, border_style="cyan"))
     console.print()
 
@@ -2111,6 +2284,8 @@ def _json_summary(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> dict[str, object]:
     """Return compact metadata for JSON consumers."""
     blocking = has_blocking_issues(
@@ -2118,7 +2293,7 @@ def _json_summary(
         allow_unused=allow_unused,
         allow_missing=allow_missing,
     )
-    return {
+    summary: dict[str, object] = {
         "counts": {
             "unused": len(result.unused),
             "missing": len(result.missing),
@@ -2132,12 +2307,22 @@ def _json_summary(
         "blocking": blocking,
         "exit_code": 1 if blocking else 0,
     }
+    if baseline_path or baseline_suppressed:
+        summary["baseline"] = {
+            "path": str(baseline_path) if baseline_path else None,
+            "suppressed": {field: baseline_suppressed.get(field, 0) for field in FINDING_FIELDS}
+            if baseline_suppressed
+            else {field: 0 for field in FINDING_FIELDS},
+        }
+    return summary
 
 
 def _json_output(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_path: Optional[Path] = None,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> None:
     """JSON machine-readable output."""
     output = {
@@ -2145,6 +2330,8 @@ def _json_output(
             result,
             allow_unused=allow_unused,
             allow_missing=allow_missing,
+            baseline_path=baseline_path,
+            baseline_suppressed=baseline_suppressed,
         ),
         "unused": result.unused,
         "missing": result.missing,
@@ -2178,6 +2365,7 @@ def format_summary_line(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> str:
     """Return a one-line terminal summary for CI/chat consumers."""
     blocking = has_blocking_issues(
@@ -2194,9 +2382,13 @@ def format_summary_line(
         (len(result.ignored_missing), "ignored"),
         (len(result.supabase_orphans), "orphaned"),
     ]
+    actual_counts_present = any(count for count, _label in counts)
     shown_counts = [_count_phrase(count, label) for count, label in counts if count]
+    suppressed_total = sum((baseline_suppressed or {}).values())
+    if suppressed_total:
+        shown_counts.append(_count_phrase(suppressed_total, "baselined"))
     counts_text = ", ".join(shown_counts) if shown_counts else "clean"
-    status = "red" if blocking else "yellow" if shown_counts else "green"
+    status = "red" if blocking else "yellow" if actual_counts_present else "green"
     return f"envguard: {status} — {counts_text} (exit {exit_code})"
 
 
@@ -2204,6 +2396,7 @@ def _summary_output(
     result: ScanResult,
     allow_unused: bool = False,
     allow_missing: bool = False,
+    baseline_suppressed: Optional[dict[str, int]] = None,
 ) -> None:
     """Print compact, non-rich terminal output."""
     print(
@@ -2211,6 +2404,7 @@ def _summary_output(
             result,
             allow_unused=allow_unused,
             allow_missing=allow_missing,
+            baseline_suppressed=baseline_suppressed,
         )
     )
 
@@ -2319,23 +2513,106 @@ def _redacted_dotenv_assignment(line: str) -> str:
 
 def _write_backup_exclusive(path: Path, content: str) -> Path:
     """Write a backup without overwriting or following existing filesystem entries."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
     index = 0
     while True:
         suffix = ".bak" if index == 0 else f".bak.{index}"
         candidate = path.with_name(f"{path.name}{suffix}")
         try:
-            fd = os.open(candidate, flags, 0o600)
+            _write_text_exclusive(candidate, content, 0o600)
         except FileExistsError:
             index += 1
             continue
-
-        with os.fdopen(fd, "w", encoding="utf-8") as backup:
-            backup.write(content)
+        _fsync_parent_dir(candidate)
         return candidate
+
+
+def _no_follow_flags(flags: int) -> int:
+    """Add O_NOFOLLOW when the platform exposes it."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    return flags | no_follow
+
+
+def _read_text_no_follow(path: Path) -> tuple[str, int]:
+    """Read a regular file without following a symlink at the final path component."""
+    fd = os.open(path, _no_follow_flags(os.O_RDONLY))
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"Refusing to read non-regular dotenv file: {path}")
+        mode = stat.S_IMODE(file_stat.st_mode)
+        with os.fdopen(fd, "r", encoding="utf-8") as file_obj:
+            fd = -1
+            return file_obj.read(), mode
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _write_text_exclusive(path: Path, content: str, mode: int) -> None:
+    """Write a new file exclusively without following an existing symlink."""
+    flags = _no_follow_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    fd = os.open(path, flags, mode)
+    try:
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            # Some platforms/filesystems may reject fchmod; the secure creation
+            # mode above is still applied by os.open.
+            pass
+        data = content.encode("utf-8")
+        while data:
+            written = os.write(fd, data)
+            if written == 0:
+                raise OSError(f"Failed to write data to {path}")
+            data = data[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """Best-effort fsync of a file's parent directory after create/replace operations."""
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_no_follow(path: Path, content: str, mode: int) -> None:
+    """Atomically replace path with content without following path symlinks."""
+    temp_path: Optional[Path] = None
+    sanitized_mode = mode & 0o777 or 0o600
+
+    for index in range(100):
+        candidate = path.with_name(f".{path.name}.envguard-{os.getpid()}-{index}.tmp")
+        try:
+            _write_text_exclusive(candidate, content, sanitized_mode)
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        break
+
+    if temp_path is None:
+        raise FileExistsError(f"Could not create a temporary file next to {path}")
+
+    try:
+        # os.replace updates the directory entry atomically. If an attacker swaps
+        # path for a symlink after our no-follow read, the symlink itself is
+        # replaced; its target is not opened or truncated.
+        os.replace(temp_path, path)
+        _fsync_parent_dir(path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def interactive_fix(
@@ -2376,10 +2653,16 @@ def interactive_fix(
 
     console = Console()
 
-    # Filter dotenv lines to keep
+    # Filter dotenv lines to keep. Real writes use a no-follow read so a path
+    # swapped after the initial symlink check is not followed before replacement.
     unused_set = set(result.unused)
+    file_mode = 0o600
     try:
-        lines = dotenv_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if dry_run:
+            text = dotenv_path.read_text(encoding="utf-8")
+        else:
+            text, file_mode = _read_text_no_follow(dotenv_path)
+        lines = text.splitlines(keepends=True)
     except OSError as e:
         print(f"Error reading {dotenv_path}: {e}", file=sys.stderr)
         return
@@ -2428,7 +2711,11 @@ def interactive_fix(
 
     if removed_lines:
         backup_path = _write_backup_exclusive(dotenv_path, "".join(lines))
-        dotenv_path.write_text("".join(keep_lines), encoding="utf-8")
+        try:
+            _atomic_write_no_follow(dotenv_path, "".join(keep_lines), file_mode)
+        except OSError as e:
+            print(f"Error writing {dotenv_path}: {e}", file=sys.stderr)
+            return
         console.print(
             f"\n[green]✓[/] Removed {len(removed_lines)} unused key(s) "
             f"from [cyan]{dotenv_path}[/]"
@@ -2649,6 +2936,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard update                    Update envguard from GitHub\n"
             "  envguard --json                    Machine-readable output\n"
             "  envguard --summary                 One-line terminal summary\n"
+            "  envguard --baseline .envguard-baseline.json\n"
+            "                                    Suppress known findings\n"
             "  envguard --details                 Show detailed issue tables\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
@@ -2712,6 +3001,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to dotenv file (default: auto-detect .env.example/.env.sample/.env)",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="Path to an envguard baseline JSON file with known findings to suppress",
+    )
+    parser.add_argument(
+        "--write-baseline",
+        type=str,
+        default=None,
+        help="Write current findings to a secret-safe baseline JSON file and exit",
     )
     parser.add_argument(
         "--debug",
@@ -2977,6 +3278,22 @@ def main(argv: Optional[List[str]] = None):
         ignore_keys=config.ignore_missing + args.ignore_missing,
     )
 
+    if args.write_baseline:
+        output_baseline_path = Path(args.write_baseline).resolve()
+        write_baseline(output_baseline_path, result)
+        print(f"Wrote envguard baseline to {output_baseline_path}")
+        return
+
+    baseline_path: Optional[Path] = None
+    baseline_suppressed: dict[str, int] = {}
+    if args.baseline or config.baseline:
+        baseline_path = (
+            Path(args.baseline).resolve()
+            if args.baseline
+            else _resolve_config_path(config.baseline or "", scan_path).resolve()
+        )
+        baseline_suppressed = apply_baseline(result, load_baseline(baseline_path))
+
     # ── Output ─────────────────────────────────────────────────────────────
     if args.github_annotations:
         _github_annotations_output(result)
@@ -2985,12 +3302,15 @@ def main(argv: Optional[List[str]] = None):
             result,
             allow_unused=args.allow_unused,
             allow_missing=args.allow_missing,
+            baseline_path=baseline_path,
+            baseline_suppressed=baseline_suppressed,
         )
     elif args.summary:
         _summary_output(
             result,
             allow_unused=args.allow_unused,
             allow_missing=args.allow_missing,
+            baseline_suppressed=baseline_suppressed,
         )
     else:
         if Console is None:
@@ -2999,6 +3319,8 @@ def main(argv: Optional[List[str]] = None):
                 result,
                 allow_unused=args.allow_unused,
                 allow_missing=args.allow_missing,
+                baseline_path=baseline_path,
+                baseline_suppressed=baseline_suppressed,
             )
         else:
             _rich_output(
@@ -3007,6 +3329,8 @@ def main(argv: Optional[List[str]] = None):
                 supabase_project,
                 show_details=args.details,
                 details_command=build_details_command(raw_argv),
+                baseline_path=baseline_path,
+                baseline_suppressed=baseline_suppressed,
             )
 
     # ── Interactive fix ────────────────────────────────────────────────────

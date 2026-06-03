@@ -56,6 +56,13 @@ For another path, run:
 envguard --path /path/to/project --no-wizard
 ```
 
+For a quick chat or CI-step status where details are not needed, use the compact
+one-line summary:
+
+```bash
+envguard --no-wizard --summary
+```
+
 If the output says details are available, rerun with the exact generated
 `--details` command shown by envguard, or use:
 
@@ -112,11 +119,58 @@ When the user asks to fix environment drift:
 4. Consider removing unused keys only after user confirmation.
 5. Rerun envguard to verify.
 
-For interactive unused-key pruning, use:
+For unused-key pruning, preview first:
+
+```bash
+envguard --fix-dry-run
+```
+
+Then use the interactive fixer when the user agrees:
 
 ```bash
 envguard --fix
 ```
+
+Do not use `--fix-real-env` unless the user explicitly asks to edit a real
+`.env` file; prefer templates such as `.env.example`, `.env.sample`, or
+`.env.template`.
+
+## Baselines
+
+When a legacy project has existing drift and the user wants incremental CI
+adoption, create a secret-safe baseline instead of weakening checks globally:
+
+```bash
+envguard --no-wizard --write-baseline .envguard-baseline.json
+envguard --no-wizard --baseline .envguard-baseline.json
+```
+
+Baseline files contain finding classes and key names only. They must not contain
+dotenv values, file references, Supabase access tokens, or secret values. New
+unbaselined findings still fail according to the normal `--allow-*` rules.
+
+## Project Defaults
+
+When the user wants repeatable envguard settings for a repository or CI, persist
+team defaults with `envguard init` instead of hand-editing config from scratch:
+
+```bash
+envguard init --dotenv config/example.env --exclude "fixtures/**"
+```
+
+Confirm before writing `pyproject.toml`. CLI flags still layer on top of the
+saved `[tool.envguard]` defaults.
+
+## Updating envguard
+
+If envguard is installed but stale, or the user asks to update it, use the
+supported updater instead of reinstalling manually:
+
+```bash
+envguard update
+```
+
+Do not run updates silently unless the user requested a tool update.
 
 ## CI Setup
 
