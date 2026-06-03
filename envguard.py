@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -2021,23 +2022,106 @@ def _redacted_dotenv_assignment(line: str) -> str:
 
 def _write_backup_exclusive(path: Path, content: str) -> Path:
     """Write a backup without overwriting or following existing filesystem entries."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
     index = 0
     while True:
         suffix = ".bak" if index == 0 else f".bak.{index}"
         candidate = path.with_name(f"{path.name}{suffix}")
         try:
-            fd = os.open(candidate, flags, 0o600)
+            _write_text_exclusive(candidate, content, 0o600)
         except FileExistsError:
             index += 1
             continue
-
-        with os.fdopen(fd, "w", encoding="utf-8") as backup:
-            backup.write(content)
+        _fsync_parent_dir(candidate)
         return candidate
+
+
+def _no_follow_flags(flags: int) -> int:
+    """Add O_NOFOLLOW when the platform exposes it."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    return flags | no_follow
+
+
+def _read_text_no_follow(path: Path) -> tuple[str, int]:
+    """Read a regular file without following a symlink at the final path component."""
+    fd = os.open(path, _no_follow_flags(os.O_RDONLY))
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"Refusing to read non-regular dotenv file: {path}")
+        mode = stat.S_IMODE(file_stat.st_mode)
+        with os.fdopen(fd, "r", encoding="utf-8") as file_obj:
+            fd = -1
+            return file_obj.read(), mode
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _write_text_exclusive(path: Path, content: str, mode: int) -> None:
+    """Write a new file exclusively without following an existing symlink."""
+    flags = _no_follow_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    fd = os.open(path, flags, mode)
+    try:
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            # Some platforms/filesystems may reject fchmod; the secure creation
+            # mode above is still applied by os.open.
+            pass
+        data = content.encode("utf-8")
+        while data:
+            written = os.write(fd, data)
+            if written == 0:
+                raise OSError(f"Failed to write data to {path}")
+            data = data[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """Best-effort fsync of a file's parent directory after create/replace operations."""
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_no_follow(path: Path, content: str, mode: int) -> None:
+    """Atomically replace path with content without following path symlinks."""
+    temp_path: Optional[Path] = None
+    sanitized_mode = mode & 0o777 or 0o600
+
+    for index in range(100):
+        candidate = path.with_name(f".{path.name}.envguard-{os.getpid()}-{index}.tmp")
+        try:
+            _write_text_exclusive(candidate, content, sanitized_mode)
+        except FileExistsError:
+            continue
+        temp_path = candidate
+        break
+
+    if temp_path is None:
+        raise FileExistsError(f"Could not create a temporary file next to {path}")
+
+    try:
+        # os.replace updates the directory entry atomically. If an attacker swaps
+        # path for a symlink after our no-follow read, the symlink itself is
+        # replaced; its target is not opened or truncated.
+        os.replace(temp_path, path)
+        _fsync_parent_dir(path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def interactive_fix(
@@ -2078,10 +2162,16 @@ def interactive_fix(
 
     console = Console()
 
-    # Filter dotenv lines to keep
+    # Filter dotenv lines to keep. Real writes use a no-follow read so a path
+    # swapped after the initial symlink check is not followed before replacement.
     unused_set = set(result.unused)
+    file_mode = 0o600
     try:
-        lines = dotenv_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if dry_run:
+            text = dotenv_path.read_text(encoding="utf-8")
+        else:
+            text, file_mode = _read_text_no_follow(dotenv_path)
+        lines = text.splitlines(keepends=True)
     except OSError as e:
         print(f"Error reading {dotenv_path}: {e}", file=sys.stderr)
         return
@@ -2130,7 +2220,11 @@ def interactive_fix(
 
     if removed_lines:
         backup_path = _write_backup_exclusive(dotenv_path, "".join(lines))
-        dotenv_path.write_text("".join(keep_lines), encoding="utf-8")
+        try:
+            _atomic_write_no_follow(dotenv_path, "".join(keep_lines), file_mode)
+        except OSError as e:
+            print(f"Error writing {dotenv_path}: {e}", file=sys.stderr)
+            return
         console.print(
             f"\n[green]✓[/] Removed {len(removed_lines)} unused key(s) "
             f"from [cyan]{dotenv_path}[/]"
