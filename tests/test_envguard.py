@@ -73,6 +73,20 @@ def test_parse_dotenv_value_handles_real_dotenv_quotes_and_comments(
     assert envguard.parse_dotenv_value(dotenv, "EMPTY_VALUE") is None
 
 
+def test_readme_dotenv_cli_reference_matches_parser_help() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    parser_help = envguard._build_parser().format_help()
+
+    assert "--dotenv DOTENV" in parser_help
+    assert "auto-detect" in parser_help
+    assert ".env.example/.env.sample/.env" in parser_help
+    assert "--dotenv PATH         Path to dotenv file." in readme
+    assert "Defaults to auto-detected templates or .env." in readme
+    assert "Defaults to <path>/.env.example" not in readme
+
+
 def test_detect_references_finds_common_environment_patterns(tmp_path: Path) -> None:
     source = tmp_path / "app.py"
     source.write_text(
