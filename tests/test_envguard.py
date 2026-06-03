@@ -176,6 +176,30 @@ def test_detect_references_finds_zod_process_env_schema_keys(tmp_path: Path) -> 
     assert {ref.pattern_type for ref in refs} == {"zod process.env schema"}
 
 
+def test_pydantic_field_ellipsis_stays_required(tmp_path: Path) -> None:
+    source = tmp_path / "settings.py"
+    source.write_text(
+        "\n".join(
+            [
+                "from pydantic import Field",
+                "from pydantic_settings import BaseSettings",
+                "",
+                "class Settings(BaseSettings):",
+                "    api_key: str = Field(...)",
+                "    token: str = Field(Ellipsis, description='required')",
+                "    timeout: int = 30",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = {ref.key: ref for ref in envguard.detect_references(source)}
+
+    assert refs["API_KEY"].pattern_type == "pydantic BaseSettings"
+    assert refs["API_KEY"].requirement == "required"
+    assert refs["API_KEY"].reason == "pydantic Field(...) marks key required"
+    assert refs["TOKEN"].requirement == "required"
+    assert refs["TIMEOUT"].requirement == "optional"
 
 
 def test_zod_process_env_schema_detection_ignores_unrelated_schemas(
