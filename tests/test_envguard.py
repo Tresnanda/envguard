@@ -580,6 +580,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'dotenv = "config/example.env"',
                 'exclude = ["fixtures/**", "snapshots/**"]',
                 'supabase_project = "abcd1234"',
+                'baseline = ".envguard-baseline.json"',
                 'optional = ["CLI_DEFAULT_BOT"]',
                 'external = ["REMOTE_CONTAINER_SECRET"]',
                 'ignore_missing = ["LEGACY_FLAG"]',
@@ -593,6 +594,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.dotenv == "config/example.env"
     assert config.exclude == ["fixtures/**", "snapshots/**"]
     assert config.supabase_project == "abcd1234"
+    assert config.baseline == ".envguard-baseline.json"
     assert config.optional == ["CLI_DEFAULT_BOT"]
     assert config.external == ["REMOTE_CONTAINER_SECRET"]
     assert config.ignore_missing == ["LEGACY_FLAG"]
@@ -780,6 +782,75 @@ def test_allow_flags_control_blocking_issue_detection() -> None:
     assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
 
 
+def test_baseline_suppresses_known_findings_and_keeps_new_ones() -> None:
+    result = envguard.ScanResult(
+        unused=["OLD_KEY", "NEW_UNUSED"],
+        missing=["KNOWN_MISSING", "NEW_MISSING"],
+        optional_missing=["KNOWN_OPTIONAL"],
+        supabase_orphans=["KNOWN_ORPHAN"],
+    )
+
+    suppressed = envguard.apply_baseline(
+        result,
+        {
+            "unused": {"OLD_KEY"},
+            "missing": {"KNOWN_MISSING"},
+            "optional_missing": {"KNOWN_OPTIONAL"},
+            "external_missing": set(),
+            "ignored_missing": set(),
+            "supabase_orphans": {"KNOWN_ORPHAN"},
+        },
+    )
+
+    assert result.unused == ["NEW_UNUSED"]
+    assert result.missing == ["NEW_MISSING"]
+    assert result.optional_missing == []
+    assert result.supabase_orphans == []
+    assert suppressed == {
+        "unused": 1,
+        "missing": 1,
+        "optional_missing": 1,
+        "supabase_orphans": 1,
+    }
+    assert envguard.has_blocking_issues(result)
+
+
+def test_write_and_load_baseline_store_only_key_names(tmp_path: Path) -> None:
+    baseline_path = tmp_path / ".envguard-baseline.json"
+    result = envguard.ScanResult(
+        references={
+            "DATABASE_URL": [
+                envguard.EnvReference(
+                    key="DATABASE_URL",
+                    file="/repo/app.py",
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        unused=["OLD_KEY"],
+        missing=["DATABASE_URL"],
+    )
+
+    envguard.write_baseline(baseline_path, result)
+
+    raw = baseline_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload == {
+        "version": 1,
+        "findings": {
+            "external_missing": [],
+            "ignored_missing": [],
+            "missing": ["DATABASE_URL"],
+            "optional_missing": [],
+            "supabase_orphans": [],
+            "unused": ["OLD_KEY"],
+        },
+    }
+    assert "/repo/app.py" not in raw
+    assert envguard.load_baseline(baseline_path)["missing"] == {"DATABASE_URL"}
+
+
 def test_json_output_includes_summary_metadata(capsys) -> None:
     result = envguard.ScanResult(
         references={
@@ -842,6 +913,40 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_json_output_includes_baseline_suppression_metadata(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    result = envguard.ScanResult(unused=["NEW_KEY"])
+    baseline_path = tmp_path / ".envguard-baseline.json"
+
+    envguard._json_output(
+        result,
+        baseline_path=baseline_path,
+        baseline_suppressed={"missing": 2},
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["summary"]["baseline"] == {
+        "path": str(baseline_path),
+        "suppressed": {
+            "unused": 0,
+            "missing": 2,
+            "optional_missing": 0,
+            "external_missing": 0,
+            "ignored_missing": 0,
+            "supabase_orphans": 0,
+        },
+    }
+
+
+def test_summary_output_includes_baselined_findings() -> None:
+    assert envguard.format_summary_line(
+        envguard.ScanResult(),
+        baseline_suppressed={"missing": 1, "unused": 1},
+    ) == "envguard: green — 2 baselined (exit 0)"
+
+
 def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
     result = envguard.ScanResult(
         unused=["OLD_KEY"],
@@ -894,6 +999,17 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     summary = envguard.parse_cli_args(["--summary", "apps/web"])
     assert summary.summary is True
     assert summary.path == "apps/web"
+
+    baseline = envguard.parse_cli_args([
+        "--baseline",
+        ".envguard-baseline.json",
+        "--write-baseline",
+        "baseline.json",
+        "apps/web",
+    ])
+    assert baseline.baseline == ".envguard-baseline.json"
+    assert baseline.write_baseline == "baseline.json"
+    assert baseline.path == "apps/web"
 
 
 def test_parse_cli_args_accepts_update_command() -> None:

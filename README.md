@@ -127,6 +127,13 @@ envguard --summary
 # envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
 ```
 
+Create a baseline for existing drift, then fail only on new findings:
+
+```bash
+envguard --write-baseline .envguard-baseline.json
+envguard --baseline .envguard-baseline.json
+```
+
 Emit GitHub Actions annotations in CI logs:
 
 ```bash
@@ -311,7 +318,9 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 usage: envguard [-h] [--path PATH] [--json] [--summary]
                 [--github-annotations] [--fix]
                 [--supabase-project SUPABASE_PROJECT]
-                [--dotenv DOTENV] [--debug] [--details] [--exclude PATTERN]
+                [--dotenv DOTENV] [--baseline BASELINE]
+                [--write-baseline WRITE_BASELINE] [--debug] [--details]
+                [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
                 [--allow-unused] [--allow-missing] [--no-wizard]
                 [path|wizard|ci|ci-template|supabase|init|update] [...]
@@ -332,6 +341,8 @@ options:
   --fix                 Interactively remove unused keys from .env.example.
   --supabase-project ID Fetch Supabase Edge Function secrets for this project.
   --dotenv PATH         Path to dotenv example file. Defaults to <path>/.env.example.
+  --baseline PATH       Suppress known findings listed in an envguard baseline JSON file.
+  --write-baseline PATH Write current findings to a secret-safe baseline JSON file and exit.
   --exclude PATTERN     Glob pattern to exclude from scanning. Can be repeated.
   --optional KEY        Mark a missing key as optional/defaulted. Can be repeated.
   --external KEY        Mark a missing key as owned by another runtime/container. Can be repeated.
@@ -352,6 +363,44 @@ envguard: red — 2 missing, 1 unused, 3 optional (exit 1)
 ```
 
 The status is `red` when blocking findings would make envguard exit non-zero, `yellow` when findings are present but allowed/advisory, and `green` when the scan is clean. Counts include nonzero `missing`, `unused`, `optional`, `external`, `ignored`, and Supabase `orphaned` findings.
+
+## Baselines
+
+Baselines let legacy projects adopt envguard incrementally. Write the current
+findings once, commit the generated JSON, and keep CI strict for any new drift:
+
+```bash
+envguard --write-baseline .envguard-baseline.json
+envguard --baseline .envguard-baseline.json
+```
+
+Baseline files store only finding classes and key names — no dotenv values,
+reference paths, Supabase tokens, or secret values:
+
+```json
+{
+  "version": 1,
+  "findings": {
+    "unused": ["OLD_API_KEY"],
+    "missing": ["DATABASE_URL"],
+    "optional_missing": [],
+    "external_missing": [],
+    "ignored_missing": [],
+    "supabase_orphans": []
+  }
+}
+```
+
+You can also store the path in project config:
+
+```toml
+[tool.envguard]
+baseline = ".envguard-baseline.json"
+```
+
+Matching findings are suppressed before output and exit-code calculation. New
+unbaselined `MISSING`, `UNUSED`, or `ORPHANED` findings still fail unless you
+also pass the existing `--allow-*` flags.
 
 ## JSON Output
 
