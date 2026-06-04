@@ -291,6 +291,26 @@ PATTERNS: List[Tuple[re.Pattern, str, frozenset[str]]] = [
         "%KEY%",
         frozenset({"windows_batch"}),
     ),
+    # PowerShell
+    (
+        re.compile(r'\$env:([A-Za-z_][A-Za-z0-9_]*)', re.IGNORECASE),
+        "$env:KEY",
+        frozenset({"powershell"}),
+    ),
+    (
+        re.compile(r'\$\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}', re.IGNORECASE),
+        "${env:KEY}",
+        frozenset({"powershell"}),
+    ),
+    (
+        re.compile(
+            r'\[(?:System\.)?Environment\]::GetEnvironmentVariable\s*'
+            r'\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']',
+            re.IGNORECASE,
+        ),
+        "[Environment]::GetEnvironmentVariable",
+        frozenset({"powershell"}),
+    ),
 ]
 
 JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
@@ -302,6 +322,7 @@ RUST_SUFFIXES = {".rs"}
 PHP_SUFFIXES = {".php"}
 JVM_SUFFIXES = {".java", ".kt", ".kts", ".scala", ".groovy"}
 WINDOWS_BATCH_SUFFIXES = {".bat", ".cmd"}
+POWERSHELL_SUFFIXES = {".ps1"}
 
 
 def _pattern_scopes_for_path(file_path: Path) -> set[str]:
@@ -328,6 +349,8 @@ def _pattern_scopes_for_path(file_path: Path) -> set[str]:
         scopes.add("shell")
     if suffix in WINDOWS_BATCH_SUFFIXES:
         scopes.add("windows_batch")
+    if suffix in POWERSHELL_SUFFIXES:
+        scopes.add("powershell")
     if _is_docker_compose_file(file_path):
         scopes.add("shell")
     if _is_github_actions_workflow(file_path):
@@ -844,7 +867,6 @@ def should_skip(path: Path, exclude_patterns: Optional[List[str]] = None) -> boo
         ".xcfilelist",
         ".xcscheme",
         ".iml",
-        ".ps1",
     }
 
     # Skip hidden dirs and common vendored dirs

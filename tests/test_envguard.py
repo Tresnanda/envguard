@@ -282,6 +282,40 @@ def test_detect_references_finds_multilanguage_env_apis(tmp_path: Path) -> None:
         assert {ref.key for ref in refs} == expected
 
 
+def test_detect_references_finds_powershell_env_patterns(tmp_path: Path) -> None:
+    source = tmp_path / "install.ps1"
+    source.write_text(
+        "\n".join(
+            [
+                "$token = $env:SUPABASE_ACCESS_TOKEN",
+                "$url = ${env:SUPABASE_URL}",
+                "$dsn = [Environment]::GetEnvironmentVariable(\"DATABASE_URL\")",
+                "$api = [System.Environment]::GetEnvironmentVariable('API_KEY')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("SUPABASE_ACCESS_TOKEN", 1, "$env:KEY"),
+        ("SUPABASE_URL", 2, "${env:KEY}"),
+        ("DATABASE_URL", 3, "[Environment]::GetEnvironmentVariable"),
+        ("API_KEY", 4, "[Environment]::GetEnvironmentVariable"),
+    }
+
+
+def test_scan_directory_includes_install_ps1_powershell_env_refs(tmp_path: Path) -> None:
+    installer = tmp_path / "install.ps1"
+    installer.write_text("$token = $env:SUPABASE_ACCESS_TOKEN\n", encoding="utf-8")
+
+    refs = envguard.scan_directory(tmp_path)
+
+    assert set(refs) == {"SUPABASE_ACCESS_TOKEN"}
+    assert refs["SUPABASE_ACCESS_TOKEN"][0].file.endswith("install.ps1")
+
+
 def test_shell_scanner_handles_defaults_but_does_not_scan_github_actions_secrets(
     tmp_path: Path,
 ) -> None:

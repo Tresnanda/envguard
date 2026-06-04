@@ -11,7 +11,7 @@ All notable changes to envguard are documented here.
 
 ## 1.0.0 - 2026-06-01
 
-- Added environment-variable reference scanning for Python, JavaScript, Deno, shell, generic `env()`, and Windows-style patterns.
+- Added environment-variable reference scanning for Python, JavaScript, Deno, shell, PowerShell, generic `env()`, and Windows-style patterns.
 - Added `.env.example` comparison with unused and missing key detection.
 - Added Supabase Edge Function secret comparison and orphan detection.
 - Added repeatable scan exclusions with `--exclude`.
