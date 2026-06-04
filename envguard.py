@@ -2495,6 +2495,9 @@ SAFE_FIX_DOTENV_SUFFIXES = (
 DOTENV_ASSIGNMENT_RE = re.compile(
     r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=",
 )
+DOTENV_BARE_KEY_RE = re.compile(
+    r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*$",
+)
 
 
 def is_template_dotenv_path(path: Path) -> bool:
@@ -2505,10 +2508,20 @@ def is_template_dotenv_path(path: Path) -> bool:
 
 def _redacted_dotenv_assignment(line: str) -> str:
     """Return a dry-run preview that never exposes dotenv values."""
-    match = DOTENV_ASSIGNMENT_RE.match(line.strip())
+    stripped = line.strip()
+    match = DOTENV_ASSIGNMENT_RE.match(stripped) or DOTENV_BARE_KEY_RE.match(stripped)
     if not match:
         return "<unparseable dotenv assignment>"
     return f"{match.group(1)}=<redacted>"
+
+
+def _dotenv_prunable_key(line: str) -> Optional[str]:
+    """Return the key for a dotenv assignment or exact bare-key line."""
+    stripped = line.strip()
+    match = DOTENV_ASSIGNMENT_RE.match(stripped) or DOTENV_BARE_KEY_RE.match(stripped)
+    if not match:
+        return None
+    return match.group(1)
 
 
 def _write_backup_exclusive(path: Path, content: str) -> Path:
@@ -2683,9 +2696,8 @@ def interactive_fix(
             keep_lines.append(line)
             continue
 
-        match = DOTENV_ASSIGNMENT_RE.match(stripped)
-        if match and match.group(1) in unused_set:
-            key = match.group(1)
+        key = _dotenv_prunable_key(stripped)
+        if key in unused_set:
             if dry_run:
                 removed_lines.append(line.rstrip())
                 keep_lines.append(line)

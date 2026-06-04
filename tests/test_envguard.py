@@ -1745,6 +1745,64 @@ def test_interactive_fix_dry_run_can_preview_real_env(
     assert "OLD_SECRET=real" not in out
 
 
+def test_interactive_fix_dry_run_previews_unused_bare_dotenv_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "# OLD_SECRET stays documented\nOLD_SECRET\nKEEP_ME=\n"
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(
+        envguard.Confirm,
+        "ask",
+        lambda *_args, **_kwargs: pytest.fail("dry run should not prompt"),
+    )
+
+    envguard.interactive_fix(result, dotenv, dry_run=True)
+
+    assert dotenv.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env.example.bak").exists()
+    out = capsys.readouterr().out
+    assert "Dry run:" in out
+    assert "OLD_SECRET=<redacted>" in out
+    assert "<unparseable dotenv assignment>" not in out
+
+
+def test_interactive_fix_prunes_only_exact_unused_bare_dotenv_key_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv = tmp_path / ".env.example"
+    original = "\n".join(
+        [
+            "# OLD_SECRET is referenced in this comment",
+            "OLD_SECRET",
+            "OLD_SECRET_EXTRA",
+            "KEEP_ME=",
+            "",
+        ]
+    )
+    dotenv.write_text(original, encoding="utf-8")
+    result = envguard.ScanResult(unused=["OLD_SECRET"])
+
+    monkeypatch.setattr(envguard.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    envguard.interactive_fix(result, dotenv)
+
+    assert dotenv.read_text(encoding="utf-8") == "\n".join(
+        [
+            "# OLD_SECRET is referenced in this comment",
+            "OLD_SECRET_EXTRA",
+            "KEEP_ME=",
+            "",
+        ]
+    )
+    assert (tmp_path / ".env.example.bak").read_text(encoding="utf-8") == original
+
+
 def test_interactive_fix_creates_backup_before_writing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
