@@ -713,6 +713,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'dotenv = "config/example.env"',
                 'exclude = ["fixtures/**", "snapshots/**"]',
                 'supabase_project = "abcd1234"',
+                "scan_supabase = false",
                 'baseline = ".envguard-baseline.json"',
                 'optional = ["CLI_DEFAULT_BOT"]',
                 'external = ["REMOTE_CONTAINER_SECRET"]',
@@ -727,10 +728,55 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.dotenv == "config/example.env"
     assert config.exclude == ["fixtures/**", "snapshots/**"]
     assert config.supabase_project == "abcd1234"
+    assert config.scan_supabase is False
     assert config.baseline == ".envguard-baseline.json"
     assert config.optional == ["CLI_DEFAULT_BOT"]
     assert config.external == ["REMOTE_CONTAINER_SECRET"]
     assert config.ignore_missing == ["LEGACY_FLAG"]
+
+
+def test_scan_supabase_false_excludes_local_functions_and_remote_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[tool.envguard]",
+                "scan_supabase = false",
+                'supabase_project = "project-ref"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text("APP_SECRET=\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.ts").write_text(
+        "const value = process.env.APP_SECRET;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "supabase" / "functions" / "hello").mkdir(parents=True)
+    (tmp_path / "supabase" / "functions" / "hello" / "index.ts").write_text(
+        "const edge = Deno.env.get('EDGE_ONLY_SECRET');\n",
+        encoding="utf-8",
+    )
+    fetched = {"called": False}
+
+    def fake_fetch(*_args: object, **_kwargs: object) -> list[str]:
+        fetched["called"] = True
+        return ["EDGE_ONLY_SECRET"]
+
+    monkeypatch.setenv("SUPABASE_ACCESS_TOKEN", "sbp_test_token")
+    monkeypatch.setattr(envguard, "fetch_supabase_secrets", fake_fetch)
+
+    envguard.main(["--json", str(tmp_path)])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert fetched["called"] is False
+    assert set(payload["references"]) == {"APP_SECRET"}
+    assert payload["missing"] == []
 
 
 def test_analyze_honors_project_level_requirement_overrides() -> None:
@@ -1498,6 +1544,122 @@ def test_detect_supabase_project_ref_reads_config_and_environment(
 
     assert detected == "local-ref"
     assert fallback == "env-ref"
+
+
+def test_detect_supabase_project_ref_reads_supabase_cli_linked_ref(tmp_path: Path) -> None:
+    linked_ref = tmp_path / "supabase" / ".temp" / "project-ref"
+    linked_ref.parent.mkdir(parents=True)
+    linked_ref.write_text("linked-ref\n", encoding="utf-8")
+
+    assert (
+        envguard.detect_supabase_project_ref(
+            tmp_path,
+            env={},
+            config=envguard.EnvguardConfig(),
+        )
+        == "linked-ref"
+    )
+
+
+def test_detect_supabase_project_ref_honors_scan_supabase_false(tmp_path: Path) -> None:
+    linked_ref = tmp_path / "supabase" / ".temp" / "project-ref"
+    linked_ref.parent.mkdir(parents=True)
+    linked_ref.write_text("linked-ref\n", encoding="utf-8")
+
+    assert (
+        envguard.detect_supabase_project_ref(
+            tmp_path,
+            env={"SUPABASE_PROJECT_REF": "env-ref"},
+            config=envguard.EnvguardConfig(scan_supabase=False),
+        )
+        is None
+    )
+
+
+def test_fetch_supabase_secrets_with_cli_parses_json_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(
+        cmd: list[str],
+        cwd: Path,
+        capture_output: bool,
+        text: bool,
+        timeout: int,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.update(
+            {
+                "cmd": cmd,
+                "cwd": cwd,
+                "capture_output": capture_output,
+                "text": text,
+                "timeout": timeout,
+                "check": check,
+            }
+        )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps([{"name": "EDGE_SECRET"}, {"name": "SECOND_SECRET"}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(envguard.subprocess, "run", fake_run)
+
+    assert envguard.fetch_supabase_secrets_with_cli("project-ref", tmp_path) == [
+        "EDGE_SECRET",
+        "SECOND_SECRET",
+    ]
+    assert captured == {
+        "cmd": [
+            "supabase",
+            "secrets",
+            "list",
+            "--project-ref",
+            "project-ref",
+            "--output",
+            "json",
+        ],
+        "cwd": tmp_path,
+        "capture_output": True,
+        "text": True,
+        "timeout": 60,
+        "check": False,
+    }
+
+
+def test_main_uses_supabase_cli_when_token_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / ".env.example").write_text("EDGE_SECRET=\n", encoding="utf-8")
+    (tmp_path / "supabase" / "functions" / "hello").mkdir(parents=True)
+    (tmp_path / "supabase" / "functions" / "hello" / "index.ts").write_text(
+        "const edge = Deno.env.get('EDGE_SECRET');\n",
+        encoding="utf-8",
+    )
+    fetched: dict[str, object] = {}
+
+    def fake_fetch(project_ref: str, scan_path: Path) -> list[str]:
+        fetched["project_ref"] = project_ref
+        fetched["scan_path"] = scan_path
+        return ["EDGE_SECRET"]
+
+    monkeypatch.delenv("SUPABASE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(envguard, "detect_supabase_project_ref", lambda *_args: "project-ref")
+    monkeypatch.setattr(envguard, "supabase_cli_available", lambda: True)
+    monkeypatch.setattr(envguard, "fetch_supabase_secrets_with_cli", fake_fetch)
+
+    envguard.main(["--json", str(tmp_path)])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert fetched == {"project_ref": "project-ref", "scan_path": tmp_path.resolve()}
+    assert payload["missing"] == []
+    assert payload["supabase_orphans"] == []
 
 
 def test_should_auto_fetch_supabase_requires_ref_token_and_edge_functions(

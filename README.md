@@ -214,9 +214,11 @@ When Supabase secrets are included:
 
 Create an access token at [app.supabase.com/account/tokens](https://app.supabase.com/account/tokens). Your project reference is the ID in a Supabase project URL such as `https://app.supabase.com/project/your-project-ref`.
 
-`envguard` also detects Supabase projects automatically from `[tool.envguard]`, `supabase/config.toml`, `SUPABASE_PROJECT_REF`, or `SUPABASE_PROJECT_ID`. Remote secrets are fetched only when a project ref is known, a Supabase access token is available, and local Edge Functions are present, so ordinary scans stay predictable.
+`envguard` also detects Supabase projects automatically from `[tool.envguard]`, the Supabase CLI linked-project file at `supabase/.temp/project-ref`, `supabase/config.toml`, `SUPABASE_PROJECT_REF`, or `SUPABASE_PROJECT_ID`. Remote secrets are fetched only when a project ref is known, local Edge Functions are present, and either `SUPABASE_ACCESS_TOKEN` is available or an authenticated `supabase` CLI can run `supabase secrets list --project-ref <ref> --output json`, so ordinary scans stay predictable.
 
-The Supabase access token can come from `SUPABASE_ACCESS_TOKEN` in your shell, the selected dotenv file, the project `.env`, or a secure prompt in `envguard wizard`. Tokens entered in the wizard are used only for that run. They are not printed, written to `pyproject.toml`, or included in the generated command preview.
+The Supabase access token can come from `SUPABASE_ACCESS_TOKEN` in your shell, the selected dotenv file, the project `.env`, or a secure prompt in `envguard wizard`. Tokens entered in the wizard are used only for that run. They are not printed, written to `pyproject.toml`, or included in the generated command preview. If you prefer Supabase CLI auth, run `supabase login` and `supabase link` in the project; envguard will use the CLI when no access token is available.
+
+Set `scan_supabase = false` in `[tool.envguard]` to opt out of Supabase-specific behavior for a project. This disables Supabase project detection, remote secret fetching, and local `supabase/functions/**` scanning unless you explicitly pass `--supabase-project` for a one-off run.
 
 ## CI Onboarding Generator
 
@@ -295,12 +297,13 @@ envguard init --dotenv config/example.env --exclude "fixtures/**"
 dotenv = "config/example.env"
 exclude = ["fixtures/**", "docs/examples/**"]
 supabase_project = "your-project-ref"
+scan_supabase = true
 optional = ["CLI_DEFAULT_BOT"]
 external = ["REMOTE_CONTAINER_SECRET"]
 ignore_missing = ["LEGACY_FLAG"]
 ```
 
-CLI flags still work on top of this configuration. For example, `--exclude` adds more ignore patterns, `--optional` / `--external` / `--ignore-missing` add per-run requirement overrides, and `--supabase-project` overrides the configured project.
+CLI flags still work on top of this configuration. For example, `--exclude` adds more ignore patterns, `--optional` / `--external` / `--ignore-missing` add per-run requirement overrides, and `--supabase-project` overrides the configured project. Use `scan_supabase = false` when a repository keeps Supabase examples or vendored functions locally but should not include `supabase/functions/**` or remote Supabase secrets in normal audits.
 
 ## Supported Reference Patterns
 
