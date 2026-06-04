@@ -125,6 +125,7 @@ class EnvguardConfig:
     dotenv: Optional[str] = None
     exclude: List[str] = field(default_factory=list)
     supabase_project: Optional[str] = None
+    scan_supabase: bool = True
     baseline: Optional[str] = None
     optional: List[str] = field(default_factory=list)
     external: List[str] = field(default_factory=list)
@@ -947,6 +948,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
 
     dotenv = raw_config.get("dotenv")
     supabase_project = raw_config.get("supabase_project")
+    scan_supabase = raw_config.get("scan_supabase", True)
     baseline = raw_config.get("baseline")
     exclude = raw_config.get("exclude", [])
     optional = raw_config.get("optional", [])
@@ -960,6 +962,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
         dotenv=dotenv if isinstance(dotenv, str) else None,
         exclude=list_of_strings(exclude),
         supabase_project=supabase_project if isinstance(supabase_project, str) else None,
+        scan_supabase=scan_supabase if isinstance(scan_supabase, bool) else True,
         baseline=baseline if isinstance(baseline, str) else None,
         optional=list_of_strings(optional),
         external=list_of_strings(external),
@@ -1300,10 +1303,16 @@ def detect_supabase_project_ref(
     config: EnvguardConfig,
 ) -> Optional[str]:
     """Detect a Supabase project reference from config files or environment."""
+    if not config.scan_supabase:
+        return None
     if config.supabase_project:
         return config.supabase_project
 
     project_root = scan_path if scan_path.is_dir() or not scan_path.exists() else scan_path.parent
+    linked_ref = detect_supabase_cli_project_ref(scan_path)
+    if linked_ref:
+        return linked_ref
+
     supabase_config = project_root / "supabase" / "config.toml"
     if supabase_config.exists():
         try:
@@ -1318,6 +1327,72 @@ def detect_supabase_project_ref(
     return env.get("SUPABASE_PROJECT_REF") or env.get("SUPABASE_PROJECT_ID")
 
 
+def detect_supabase_cli_project_ref(scan_path: Path) -> Optional[str]:
+    """Detect a Supabase CLI linked project ref without invoking network commands."""
+    project_root = scan_path if scan_path.is_dir() or not scan_path.exists() else scan_path.parent
+    linked_ref_path = project_root / "supabase" / ".temp" / "project-ref"
+    try:
+        linked_ref = linked_ref_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return linked_ref or None
+
+
+def supabase_cli_available() -> bool:
+    """Return True when the Supabase CLI is installed."""
+    return shutil.which("supabase") is not None
+
+
+def fetch_supabase_secrets_with_cli(project_ref: str, scan_path: Path) -> List[str]:
+    """Fetch Supabase secret names through an authenticated Supabase CLI session."""
+    project_root = scan_path if scan_path.is_dir() else scan_path.parent
+    cmd = [
+        "supabase",
+        "secrets",
+        "list",
+        "--project-ref",
+        project_ref,
+        "--output",
+        "json",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(
+            "Error: Failed to run Supabase CLI secrets list: "
+            f"{_redact_supabase_secret_text(str(exc))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "unknown Supabase CLI error"
+        print(
+            "Error: Failed to fetch Supabase secrets with Supabase CLI: "
+            f"{_redact_supabase_secret_text(message)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        data = json.loads(result.stdout or "[]")
+        return _parse_supabase_secret_names(data)
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(
+            "Error: Failed to parse Supabase CLI secrets output: "
+            f"{_redact_supabase_secret_text(str(exc))}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def has_supabase_edge_functions(scan_path: Path) -> bool:
     """Return True when a project contains local Supabase Edge Functions."""
     project_root = scan_path if scan_path.is_dir() else scan_path.parent
@@ -1329,11 +1404,12 @@ def should_auto_fetch_supabase(
     scan_path: Path,
     project_ref: Optional[str],
     env: Mapping[str, str],
+    cli_available: bool = False,
 ) -> bool:
     """Return True when envguard can safely include Supabase remote secrets."""
     return bool(
         project_ref
-        and env.get("SUPABASE_ACCESS_TOKEN")
+        and (env.get("SUPABASE_ACCESS_TOKEN") or cli_available)
         and has_supabase_edge_functions(scan_path)
     )
 
@@ -3182,6 +3258,8 @@ def main(argv: Optional[List[str]] = None):
         dotenv_path = detected_dotenv.resolve() if detected_dotenv else scan_path / ".env.example"
 
     exclude_patterns = [*config.exclude, *args.exclude]
+    if not config.scan_supabase and args.supabase_project is None:
+        exclude_patterns.append("supabase/functions/**")
     explicit_supabase_project = args.supabase_project is not None
     supabase_project = args.supabase_project or detect_supabase_project_ref(
         scan_path,
@@ -3214,33 +3292,43 @@ def main(argv: Optional[List[str]] = None):
 
     # ── Fetch Supabase secrets ─────────────────────────────────────────────
     supabase_keys: Optional[List[str]] = None
+    supabase_cli_ready = supabase_cli_available()
     if supabase_project:
-        if not supabase_access_token:
-            if explicit_supabase_project and args.command != "doctor":
+        should_fetch = explicit_supabase_project or should_auto_fetch_supabase(
+            scan_path,
+            supabase_project,
+            {"SUPABASE_ACCESS_TOKEN": supabase_access_token or ""},
+            cli_available=supabase_cli_ready,
+        )
+        if should_fetch and supabase_access_token:
+            if args.debug:
+                print(f"[debug] Fetching secrets for Supabase project: {supabase_project}")
+            supabase_keys = fetch_supabase_secrets(supabase_project, supabase_access_token)
+        elif should_fetch and supabase_cli_ready:
+            if args.debug:
                 print(
-                    "Error: SUPABASE_ACCESS_TOKEN environment variable is required "
-                    "when using --supabase-project. You can also place it in .env "
-                    "or enter it through envguard wizard.",
-                    file=sys.stderr,
+                    "[debug] Fetching secrets with Supabase CLI for project: "
+                    f"{supabase_project}"
                 )
-                sys.exit(1)
+            supabase_keys = fetch_supabase_secrets_with_cli(supabase_project, scan_path)
+        elif explicit_supabase_project and args.command != "doctor":
+            print(
+                "Error: SUPABASE_ACCESS_TOKEN environment variable or an authenticated "
+                "Supabase CLI is required when using --supabase-project. You can also "
+                "place SUPABASE_ACCESS_TOKEN in .env or enter it through envguard wizard.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif not supabase_access_token and not supabase_cli_ready:
             doctor_notes.append(
-                "Supabase project detected, but SUPABASE_ACCESS_TOKEN was not available; "
-                "Supabase availability was not checked."
+                "Supabase project detected, but SUPABASE_ACCESS_TOKEN and an authenticated "
+                "Supabase CLI were not available; Supabase availability was not checked."
             )
             if args.debug and has_supabase_edge_functions(scan_path):
                 print(
                     "[debug] Supabase project detected, but SUPABASE_ACCESS_TOKEN "
-                    "is not set; skipping remote secrets."
+                    "is not set and Supabase CLI is unavailable; skipping remote secrets."
                 )
-        elif explicit_supabase_project or should_auto_fetch_supabase(
-            scan_path,
-            supabase_project,
-            {"SUPABASE_ACCESS_TOKEN": supabase_access_token},
-        ):
-            if args.debug:
-                print(f"[debug] Fetching secrets for Supabase project: {supabase_project}")
-            supabase_keys = fetch_supabase_secrets(supabase_project, supabase_access_token)
         elif args.debug:
             print(
                 f"[debug] Supabase project detected ({supabase_project}), but no "
