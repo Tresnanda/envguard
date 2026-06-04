@@ -1,6 +1,6 @@
 # envguard
 
-Environment-variable audits for Python, JavaScript, shell, and Supabase Edge Function projects.
+Environment-variable audits for Python, JavaScript, shell, PowerShell, and Supabase Edge Function projects.
 
 `envguard` scans a codebase for environment variable references, compares those references with `.env.example`, and can optionally include Supabase Edge Function secrets in the same audit. It helps catch stale config, missing deployment secrets, and undocumented variables before they become production incidents.
 
@@ -316,6 +316,9 @@ CLI flags still work on top of this configuration. For example, `--exclude` adds
 | Deno | `Deno.env.get("KEY")` | `Deno.env.get("SUPABASE_URL")` |
 | Shell | `${KEY}` | `${DATABASE_URL}` |
 | Shell | `$KEY` | `$PATH` |
+| PowerShell | `$env:KEY` | `$env:SUPABASE_ACCESS_TOKEN` |
+| PowerShell | `${env:KEY}` | `${env:SUPABASE_URL}` |
+| PowerShell | `[Environment]::GetEnvironmentVariable("KEY")` | `[Environment]::GetEnvironmentVariable("DATABASE_URL")` |
 | Generic | `env("KEY")` | `env("LOG_LEVEL")` |
 | Windows-style | `%KEY%` | `%USERNAME%` |
 
