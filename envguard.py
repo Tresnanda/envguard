@@ -207,6 +207,16 @@ PATTERNS: List[Tuple[re.Pattern, str, frozenset[str]]] = [
         "Deno.env.get",
         frozenset({"js"}),
     ),
+    (
+        re.compile(r'Bun\.env\.([A-Za-z_][A-Za-z0-9_]*)'),
+        "Bun.env.KEY",
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'Bun\.env\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        'Bun.env["KEY"]',
+        frozenset({"js"}),
+    ),
     # Ruby
     (
         re.compile(r'ENV\.fetch\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
@@ -478,7 +488,7 @@ def _classify_reference(
     absolute_offset: int,
 ) -> tuple[str, str]:
     """Classify whether a reference is required, optional, or external."""
-    if pattern_type.startswith("process.env") and _is_offset_in_raw_js_template(
+    if pattern_type.startswith(("process.env", "Bun.env")) and _is_offset_in_raw_js_template(
         full_text,
         absolute_offset,
     ):
@@ -499,6 +509,9 @@ def _classify_reference(
     if pattern_type in {
         "process.env.KEY",
         'process.env["KEY"]',
+        "process.env destructuring",
+        "Bun.env.KEY",
+        'Bun.env["KEY"]',
         "Deno.env.get",
         "os.getenv",
         "os.environ.get",
@@ -602,6 +615,64 @@ def _detect_sveltekit_refs(
                 file_path,
                 _line_for_offset(text, match.start()),
                 "$env/dynamic.KEY",
+            )
+
+
+def _detect_process_env_destructuring_refs(
+    file_path: Path,
+    text: str,
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+) -> None:
+    """Detect JavaScript destructuring reads from process.env."""
+    if "process.env" not in text:
+        return
+
+    destructure_pattern = re.compile(
+        r'(?:\b(?:const|let|var)\s+)?\{(?P<body>.*?)\}\s*=\s*process\.env\b',
+        re.DOTALL,
+    )
+    key_pattern = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\b\s*(?::|=|$)')
+    for match in destructure_pattern.finditer(text):
+        body = match.group("body")
+        body_start = match.start("body")
+        for item_match in re.finditer(r"[^,]+", body):
+            raw_item = item_match.group(0)
+            leading_whitespace = len(raw_item) - len(raw_item.lstrip())
+            item = raw_item.strip()
+            if not item or item.startswith("..."):
+                continue
+            key_match = key_pattern.match(item)
+            if not key_match:
+                continue
+
+            absolute_offset = body_start + item_match.start() + leading_whitespace
+            key = key_match.group(1)
+            line = _line_for_offset(text, absolute_offset)
+            line_start = text.rfind("\n", 0, absolute_offset) + 1
+            line_end = text.find("\n", absolute_offset)
+            if line_end == -1:
+                line_end = len(text)
+            line_text = text[line_start:line_end]
+            match_start = absolute_offset - line_start
+            requirement, reason = _classify_reference(
+                "process.env destructuring",
+                line_text,
+                match_start,
+                match_start + len(key),
+                key,
+                text,
+                absolute_offset,
+            )
+            _add_ref(
+                refs,
+                seen,
+                key,
+                file_path,
+                line,
+                "process.env destructuring",
+                requirement,
+                reason,
             )
 
 
@@ -745,6 +816,7 @@ def detect_references(file_path: Path) -> List[EnvReference]:
                 )
 
     if "js" in scopes:
+        _detect_process_env_destructuring_refs(file_path, text, refs, seen)
         _detect_sveltekit_refs(file_path, text, refs, seen)
         _detect_zod_process_env_schema_refs(file_path, text, refs, seen)
     if "python" in scopes:
