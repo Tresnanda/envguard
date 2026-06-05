@@ -46,9 +46,31 @@ except ImportError:
 
 APP_NAME = "envguard"
 DIST_NAME = "envguard"
+__version__ = "1.0.0"
+JSON_SCHEMA_VERSION = 1
 REPO_URL = "https://github.com/Tresnanda/envguard.git"
 REPO_SPEC = f"git+{REPO_URL}"
 MIN_PYTHON = (3, 9)
+
+
+def tool_version() -> str:
+    """Return the installed envguard version for machine-readable output."""
+    try:
+        return importlib.metadata.version(DIST_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return __version__
+
+
+def _json_schema_metadata(mode: str) -> dict[str, object]:
+    """Return stable top-level metadata for JSON consumers."""
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "tool_version": tool_version(),
+        "scan": {
+            "kind": "envguard.scan",
+            "mode": mode,
+        },
+    }
 
 
 # ─── Data Structures ───────────────────────────────────────────────────────
@@ -1981,6 +2003,7 @@ def _availability_marker(value: Optional[bool]) -> str:
 
 def _matrix_json_output(matrix: SecretsMatrix) -> None:
     output = {
+        **_json_schema_metadata("secrets-matrix"),
         "summary": {
             "counts": _matrix_counts(matrix),
             "blocking": secrets_matrix_has_required_missing(matrix),
@@ -2424,6 +2447,7 @@ def _json_output(
 ) -> None:
     """JSON machine-readable output."""
     output = {
+        **_json_schema_metadata("env-audit"),
         "summary": _json_summary(
             result,
             allow_unused=allow_unused,

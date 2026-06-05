@@ -1153,6 +1153,21 @@ def test_json_output_includes_baseline_suppression_metadata(
     }
 
 
+def test_json_output_includes_stable_schema_metadata_and_legacy_fields(capsys) -> None:
+    result = envguard.ScanResult(unused=["OLD_KEY"])
+
+    envguard._json_output(result)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema_version"] == 1
+    assert output["tool_version"] == envguard.tool_version()
+    assert output["scan"] == {"kind": "envguard.scan", "mode": "env-audit"}
+    assert output["summary"]["counts"]["unused"] == 1
+    assert output["unused"] == ["OLD_KEY"]
+    assert output["missing"] == []
+    assert output["references"] == {}
+
+
 def test_summary_output_includes_baselined_findings() -> None:
     assert envguard.format_summary_line(
         envguard.ScanResult(),
@@ -1297,6 +1312,28 @@ def test_build_secrets_matrix_reports_sources_and_requirements_without_values(
     assert payload["rows"][0]["available"]["supabase"] in {True, False}
     assert "shell-secret" not in output
     assert "optional-secret" not in output
+
+
+def test_matrix_json_output_includes_stable_schema_metadata_and_legacy_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix = envguard.build_secrets_matrix(
+        {"DATABASE_URL": [envguard.EnvReference("DATABASE_URL", "app.py", 1, "os.getenv")]},
+        dotenv_keys=["DATABASE_URL"],
+        env={},
+        dotenv_path=Path(".env.example"),
+    )
+
+    envguard._matrix_json_output(matrix)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema_version"] == 1
+    assert output["tool_version"] == envguard.tool_version()
+    assert output["scan"] == {"kind": "envguard.scan", "mode": "secrets-matrix"}
+    assert output["summary"]["counts"]["ready"] == 1
+    assert output["sources"]["dotenv"] == ".env.example"
+    assert output["rows"][0]["key"] == "DATABASE_URL"
+    assert output["unused_dotenv"] == []
 
 
 def test_doctor_command_prints_json_matrix_without_dotenv_values(
