@@ -629,7 +629,7 @@ def _detect_process_env_destructuring_refs(
         return
 
     destructure_pattern = re.compile(
-        r'(?:\b(?:const|let|var)\s+)?\{(?P<body>.*?)\}\s*=\s*process\.env\b',
+        r'(?:\b(?:const|let|var)\s+)?\{(?P<body>[^{}]*)\}\s*=\s*process\.env\b',
         re.DOTALL,
     )
     key_pattern = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\b\s*(?::|=|$)')
@@ -655,15 +655,22 @@ def _detect_process_env_destructuring_refs(
                 line_end = len(text)
             line_text = text[line_start:line_end]
             match_start = absolute_offset - line_start
-            requirement, reason = _classify_reference(
-                "process.env destructuring",
-                line_text,
-                match_start,
-                match_start + len(key),
-                key,
-                text,
-                absolute_offset,
+            has_default = re.match(
+                rf'{re.escape(key)}\s*(?:=|:\s*[A-Za-z_$][A-Za-z0-9_$]*\s*=)',
+                item,
             )
+            if has_default:
+                requirement, reason = "optional", "inline default or guard"
+            else:
+                requirement, reason = _classify_reference(
+                    "process.env destructuring",
+                    line_text,
+                    match_start,
+                    match_start + len(key),
+                    key,
+                    text,
+                    absolute_offset,
+                )
             _add_ref(
                 refs,
                 seen,

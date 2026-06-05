@@ -191,6 +191,44 @@ def test_detect_references_finds_js_runtime_env_expansions(tmp_path: Path) -> No
     }
 
 
+def test_detect_references_finds_process_env_destructuring_after_unrelated_braces(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "function f() { return { x: 1 }; }\nconst { DATABASE_URL } = process.env;",
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("DATABASE_URL", 2, "process.env destructuring"),
+    }
+
+
+def test_detect_references_classifies_process_env_destructuring_defaults_optional(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "\n".join(
+            [
+                'const { DATABASE_URL = "sqlite" } = process.env;',
+                'const { API_KEY: apiKey = "test-key" } = process.env;',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.requirement, ref.reason) for ref in refs} == {
+        ("DATABASE_URL", "optional", "inline default or guard"),
+        ("API_KEY", "optional", "inline default or guard"),
+    }
+
+
 def test_detect_references_classifies_bun_env_inside_raw_template_as_external(
     tmp_path: Path,
 ) -> None:
