@@ -119,6 +119,38 @@ class SecretsMatrix:
 
 
 @dataclass
+class RemediationProposal:
+    """One dry, copy-pasteable remediation suggestion."""
+
+    kind: str
+    label: str
+    command: Optional[str] = None
+    note: str = ""
+
+
+@dataclass
+class RemediationAction:
+    """Proposal-only next steps for one finding key."""
+
+    key: str
+    finding: str
+    status: str
+    requirement: str
+    proposals: List[RemediationProposal]
+
+
+@dataclass
+class RemediationPlan:
+    """A non-mutating remediation plan derived from the doctor matrix."""
+
+    actions: List[RemediationAction]
+    counts: dict[str, int]
+    dotenv_path: Optional[Path] = None
+    supabase_project: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
 class EnvguardConfig:
     """Configuration loaded from [tool.envguard] in pyproject.toml."""
 
@@ -2122,6 +2154,252 @@ def _matrix_output(matrix: SecretsMatrix, json_output: bool = False) -> None:
         _matrix_rich_output(matrix)
 
 
+# ─── Remediation plan output ─────────────────────────────────────────────────
+
+PLAN_PLACEHOLDER = "replace-me"
+
+
+def _dotenv_plan_path(dotenv_path: Optional[Path], scan_path: Path) -> str:
+    target = dotenv_path or (scan_path if scan_path.is_dir() else scan_path.parent) / ".env.example"
+    base = scan_path if scan_path.is_dir() else scan_path.parent
+    return _display_path(target, base)
+
+
+def _scan_plan_path(scan_path: Path) -> str:
+    return _display_path(scan_path, Path.cwd())
+
+
+def _dotenv_append_command(key: str, dotenv_path: Optional[Path], scan_path: Path) -> str:
+    dotenv_display = shlex.quote(_dotenv_plan_path(dotenv_path, scan_path))
+    return f"printf '%s\\n' '{key}=' >> {dotenv_display}"
+
+
+def _supabase_set_command(key: str, project_ref: Optional[str]) -> str:
+    ref = project_ref or "YOUR_PROJECT_REF"
+    return f"supabase secrets set {key}='{PLAN_PLACEHOLDER}' --project-ref {shlex.quote(ref)}"
+
+
+def _envguard_override_command(flag: str, key: str, scan_path: Path) -> str:
+    args = ["envguard", flag, key]
+    path_arg = _scan_plan_path(scan_path)
+    if path_arg != ".":
+        args.append(path_arg)
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def _supabase_unset_command(key: str, project_ref: Optional[str]) -> str:
+    ref = project_ref or "YOUR_PROJECT_REF"
+    return f"supabase secrets unset {key} --project-ref {shlex.quote(ref)}"
+
+
+def _plan_proposals_for_row(
+    row: SecretsMatrixRow,
+    scan_path: Path,
+    dotenv_path: Optional[Path],
+    supabase_project: Optional[str],
+) -> List[RemediationProposal]:
+    proposals = [
+        RemediationProposal(
+            kind="add_dotenv_example",
+            label="Document the key in the dotenv contract",
+            command=_dotenv_append_command(row.key, dotenv_path, scan_path),
+            note="Adds an empty placeholder only; choose and store the real value separately.",
+        )
+    ]
+    if row.status == "missing":
+        proposals.extend(
+            [
+                RemediationProposal(
+                    kind="set_supabase_secret",
+                    label="Set a Supabase Edge Function secret placeholder",
+                    command=_supabase_set_command(row.key, supabase_project),
+                    note=(
+                        "Replace the placeholder before running; envguard never "
+                        "prints secret values."
+                    ),
+                ),
+                RemediationProposal(
+                    kind="mark_optional",
+                    label="If the key is defaulted, mark it optional for envguard",
+                    command=_envguard_override_command("--optional", row.key, scan_path),
+                ),
+                RemediationProposal(
+                    kind="mark_external",
+                    label="If another runtime owns the key, mark it external for envguard",
+                    command=_envguard_override_command("--external", row.key, scan_path),
+                ),
+            ]
+        )
+    elif row.status == "optional-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="mark_optional",
+                label="Persist the optional classification in envguard config or CLI usage",
+                command=_envguard_override_command("--optional", row.key, scan_path),
+            )
+        )
+    elif row.status == "external-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="mark_external",
+                label="Persist the external/runtime classification in envguard config or CLI usage",
+                command=_envguard_override_command("--external", row.key, scan_path),
+            )
+        )
+    elif row.status == "ignored-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="review_ignore",
+                label="Review the ignore-missing override and keep it only if intentional",
+                note=(
+                    "Ignored missing keys are advisory because envguard config "
+                    "already suppresses them."
+                ),
+            )
+        )
+    return proposals
+
+
+def build_remediation_plan(matrix: SecretsMatrix, scan_path: Path) -> RemediationPlan:
+    """Build dry remediation proposals from doctor findings without reading values."""
+    actions: List[RemediationAction] = []
+    for row in matrix.rows:
+        if row.status == "ready":
+            continue
+        actions.append(
+            RemediationAction(
+                key=row.key,
+                finding=row.status.replace("-", "_"),
+                status=row.status,
+                requirement=row.requirement,
+                proposals=_plan_proposals_for_row(
+                    row,
+                    scan_path,
+                    matrix.dotenv_path,
+                    matrix.supabase_project,
+                ),
+            )
+        )
+
+    for key in matrix.supabase_orphans:
+        actions.append(
+            RemediationAction(
+                key=key,
+                finding="supabase_orphan",
+                status="orphaned",
+                requirement="review",
+                proposals=[
+                    RemediationProposal(
+                        kind="review_orphan",
+                        label="Review whether this remote Supabase secret is still needed",
+                        command=_supabase_unset_command(key, matrix.supabase_project),
+                        note="Run the command only after confirming the secret is stale.",
+                    )
+                ],
+            )
+        )
+
+    counts = _matrix_counts(matrix)
+    return RemediationPlan(
+        actions=actions,
+        counts={
+            "missing": counts["missing"],
+            "optional_missing": counts["optional_missing"],
+            "external_missing": counts["external_missing"],
+            "ignored_missing": counts["ignored_missing"],
+            "supabase_orphans": counts["supabase_orphans"],
+        },
+        dotenv_path=matrix.dotenv_path,
+        supabase_project=matrix.supabase_project,
+        notes=matrix.notes,
+    )
+
+
+def _plan_json_output(plan: RemediationPlan) -> None:
+    output = {
+        "summary": {
+            "counts": plan.counts,
+            "writes": False,
+            "exit_code": 0,
+        },
+        "sources": {
+            "dotenv": str(plan.dotenv_path) if plan.dotenv_path else None,
+            "supabase_project": plan.supabase_project,
+        },
+        "notes": [
+            "Proposal-only remediation plan: no prompts, backups, dotenv writes, "
+            "or secret writes were run.",
+            *plan.notes,
+        ],
+        "actions": [
+            {
+                "key": action.key,
+                "finding": action.finding,
+                "status": action.status,
+                "requirement": action.requirement,
+                "proposals": [
+                    {
+                        "kind": proposal.kind,
+                        "label": proposal.label,
+                        **({"command": proposal.command} if proposal.command else {}),
+                        **({"note": proposal.note} if proposal.note else {}),
+                    }
+                    for proposal in action.proposals
+                ],
+            }
+            for action in actions_sorted(plan.actions)
+        ],
+    }
+    print(json.dumps(output, indent=2))
+
+
+def actions_sorted(actions: List[RemediationAction]) -> List[RemediationAction]:
+    return sorted(actions, key=lambda action: (action.finding, action.key))
+
+
+def _plan_plain_output(plan: RemediationPlan) -> None:
+    print("envguard plan — remediation proposals (dry run)")
+    print(
+        "Values are hidden. No files were written, no backups were created, "
+        "and no secrets were changed."
+    )
+    if plan.dotenv_path:
+        print(f"dotenv: {plan.dotenv_path}")
+    if plan.supabase_project:
+        print(f"supabase: {plan.supabase_project}")
+    print()
+
+    if not plan.actions:
+        print("No missing or orphaned secret findings need remediation.")
+    for action in actions_sorted(plan.actions):
+        print(f"{action.finding}: {action.key}")
+        for proposal in action.proposals:
+            print(f"  - {proposal.label}")
+            if proposal.command:
+                print(f"    {proposal.command}")
+            if proposal.note:
+                print(f"    note: {proposal.note}")
+        print()
+
+    print(
+        "summary: "
+        f"{plan.counts['missing']} missing, "
+        f"{plan.counts['optional_missing']} optional missing, "
+        f"{plan.counts['external_missing']} external missing, "
+        f"{plan.counts['ignored_missing']} ignored missing, "
+        f"{plan.counts['supabase_orphans']} orphaned Supabase secrets"
+    )
+    for note in plan.notes:
+        print(f"note: {note}")
+
+
+def _plan_output(plan: RemediationPlan, json_output: bool = False) -> None:
+    if json_output:
+        _plan_json_output(plan)
+    else:
+        _plan_plain_output(plan)
+
+
 BASELINE_VERSION = 1
 FINDING_FIELDS = (
     "unused",
@@ -3039,6 +3317,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard wizard                   Build the right command interactively\n"
             "  envguard apps/web                  Scan a specific project\n"
             "  envguard doctor                    Show secret readiness matrix\n"
+            "  envguard plan                      Print dry remediation proposals\n"
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard ci-template               Print a GitHub Actions workflow\n"
             "  envguard supabase xyz              Compare with Supabase secrets\n"
@@ -3049,6 +3328,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard --baseline .envguard-baseline.json\n"
             "                                    Suppress known findings\n"
             "  envguard --details                 Show detailed issue tables\n"
+            "  envguard doctor --plan             Plan fixes from doctor findings\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
         ),
@@ -3058,7 +3338,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help=(
             "Optional project path or preset: wizard, ci, ci-template, "
-            "doctor, matrix, supabase <project-ref>, init, update"
+            "doctor, matrix, plan, supabase <project-ref>, init, update"
         ),
     )
     parser.add_argument(
@@ -3081,6 +3361,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--github-annotations",
         action="store_true",
         help="Output GitHub Actions annotations for CI logs",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Print dry, copy-pasteable remediation proposals for doctor findings",
     )
     parser.add_argument(
         "--fix",
@@ -3186,7 +3471,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments and friendly command presets."""
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    parse_argv = list(sys.argv[1:] if argv is None else argv)
+    plan_requested = "--plan" in parse_argv
+    if plan_requested:
+        parse_argv = [arg for arg in parse_argv if arg != "--plan"]
+    args = parser.parse_args(parse_argv)
+    if plan_requested:
+        args.plan = True
     tokens = list(args.tokens)
     args.command = None
 
@@ -3202,6 +3493,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             args.command = "doctor"
             if len(tokens) > 2:
                 parser.error(f"{first} accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
+        elif first == "plan":
+            args.command = "plan"
+            if len(tokens) > 2:
+                parser.error("plan accepts at most one project path")
             if len(tokens) == 2:
                 args.path = tokens[1]
         elif first == "ci-template":
@@ -3345,7 +3642,7 @@ def main(argv: Optional[List[str]] = None):
                     f"{supabase_project}"
                 )
             supabase_keys = fetch_supabase_secrets_with_cli(supabase_project, scan_path)
-        elif explicit_supabase_project and args.command != "doctor":
+        elif explicit_supabase_project and args.command not in {"doctor", "plan"}:
             print(
                 "Error: SUPABASE_ACCESS_TOKEN environment variable or an authenticated "
                 "Supabase CLI is required when using --supabase-project. You can also "
@@ -3372,7 +3669,7 @@ def main(argv: Optional[List[str]] = None):
             print(f"[debug] Supabase secrets ({len(supabase_keys)}): {supabase_keys}")
             print()
 
-    if args.command == "doctor":
+    if args.command in {"doctor", "plan"}:
         matrix = build_secrets_matrix(
             ref_map,
             dotenv_keys,
@@ -3385,6 +3682,9 @@ def main(argv: Optional[List[str]] = None):
             supabase_project=supabase_project,
             notes=doctor_notes,
         )
+        if args.command == "plan" or args.plan:
+            _plan_output(build_remediation_plan(matrix, scan_path), json_output=args.json)
+            return
         _matrix_output(matrix, json_output=args.json)
         if secrets_matrix_has_required_missing(matrix) and not args.allow_missing:
             sys.exit(1)

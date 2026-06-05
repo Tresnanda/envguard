@@ -1348,6 +1348,118 @@ def test_doctor_command_exits_nonzero_for_required_missing(tmp_path: Path) -> No
     assert exc.value.code == 1
 
 
+def test_parse_cli_args_accepts_plan_command_and_doctor_plan_flag() -> None:
+    plan = envguard.parse_cli_args(["plan", "apps/web"])
+    assert plan.command == "plan"
+    assert plan.path == "apps/web"
+    assert plan.plan is False
+
+    doctor_plan = envguard.parse_cli_args(["doctor", "--plan", "apps/api"])
+    assert doctor_plan.command == "doctor"
+    assert doctor_plan.plan is True
+    assert doctor_plan.path == "apps/api"
+
+
+def test_plan_command_prints_redacted_copy_pasteable_actions_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                'MISSING_SECRET = os.getenv("MISSING_SECRET")',
+                'OPTIONAL_SECRET = os.getenv("OPTIONAL_SECRET", "fallback")',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=DOTENV_VALUE_SHOULD_STAY_HIDDEN\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "supabase" / "functions").mkdir(parents=True)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    monkeypatch.setattr(envguard, "supabase_cli_available", lambda: True)
+    monkeypatch.setattr(
+        envguard,
+        "fetch_supabase_secrets_with_cli",
+        lambda project_ref, scan_path: ["ORPHAN_EDGE_SECRET"],
+    )
+    monkeypatch.setattr(
+        envguard.Confirm,
+        "ask",
+        lambda *_args, **_kwargs: pytest.fail("plan mode should not prompt"),
+    )
+
+    envguard.main(["--json", "--supabase-project", "project-ref", "plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    actions = {action["key"]: action for action in payload["actions"]}
+
+    assert payload["summary"] == {
+        "counts": {
+            "missing": 1,
+            "optional_missing": 1,
+            "external_missing": 0,
+            "ignored_missing": 0,
+            "supabase_orphans": 1,
+        },
+        "writes": False,
+        "exit_code": 0,
+    }
+    assert "MISSING_SECRET" in actions
+    assert {
+        proposal["kind"] for proposal in actions["MISSING_SECRET"]["proposals"]
+    } == {"add_dotenv_example", "set_supabase_secret", "mark_optional", "mark_external"}
+    assert any(
+        proposal["command"] == "printf '%s\\n' 'MISSING_SECRET=' >> .env.example"
+        for proposal in actions["MISSING_SECRET"]["proposals"]
+    )
+    assert any(
+        proposal["command"]
+        == "supabase secrets set MISSING_SECRET='replace-me' --project-ref project-ref"
+        for proposal in actions["MISSING_SECRET"]["proposals"]
+    )
+    assert actions["OPTIONAL_SECRET"]["finding"] == "optional_missing"
+    assert actions["ORPHAN_EDGE_SECRET"]["finding"] == "supabase_orphan"
+    assert any(
+        proposal["kind"] == "review_orphan"
+        for proposal in actions["ORPHAN_EDGE_SECRET"]["proposals"]
+    )
+    assert "DOTENV_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert not (tmp_path / ".env.example.bak").exists()
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_doctor_plan_flag_uses_plan_mode_without_failing_for_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+
+    envguard.main(["doctor", "--plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert "envguard plan" in output
+    assert "MISSING_SECRET" in output
+    assert "No files were written" in output
+
+
 def test_parse_cli_args_accepts_update_command() -> None:
     args = envguard.parse_cli_args(["update"])
 
