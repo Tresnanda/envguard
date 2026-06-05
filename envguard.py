@@ -2172,7 +2172,8 @@ def _scan_plan_path(scan_path: Path) -> str:
 
 def _dotenv_append_command(key: str, dotenv_path: Optional[Path], scan_path: Path) -> str:
     dotenv_display = shlex.quote(_dotenv_plan_path(dotenv_path, scan_path))
-    return f"printf '%s\\n' '{key}=' >> {dotenv_display}"
+    key_assignment = shlex.quote(f"{key}=")
+    return f"printf '%s\\n' {key_assignment} >> {dotenv_display}"
 
 
 def _supabase_set_command(key: str, project_ref: Optional[str]) -> str:
@@ -3538,9 +3539,11 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                 parser.error("expected one project path")
             args.path = first
 
+    plan_mode = args.plan or args.command == "plan"
+    if plan_mode and (args.fix or args.fix_dry_run or args.write_baseline):
+        parser.error("plan cannot be combined with fix modes or --write-baseline")
+
     if args.plan:
-        if args.fix or args.fix_dry_run or args.write_baseline:
-            parser.error("--plan cannot be combined with fix modes or --write-baseline")
         if args.command not in {None, "doctor", "plan"}:
             parser.error(f"--plan is not supported with the {args.command} command")
         if args.github_annotations:

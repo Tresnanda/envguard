@@ -1421,7 +1421,8 @@ def test_plan_command_prints_redacted_copy_pasteable_actions_without_writes(
         proposal["kind"] for proposal in actions["MISSING_SECRET"]["proposals"]
     } == {"add_dotenv_example", "set_supabase_secret", "mark_optional", "mark_external"}
     assert any(
-        proposal["command"] == "printf '%s\\n' 'MISSING_SECRET=' >> .env.example"
+        shlex.split(proposal["command"])
+        == ["printf", "%s\\n", "MISSING_SECRET=", ">>", ".env.example"]
         for proposal in actions["MISSING_SECRET"]["proposals"]
     )
     assert any(
@@ -1491,6 +1492,20 @@ def test_plan_supabase_commands_quote_untrusted_key_names(tmp_path: Path) -> Non
     ]
 
 
+def test_plan_dotenv_append_command_quotes_untrusted_key_names(tmp_path: Path) -> None:
+    malicious_key = "BAD_KEY' ; touch /tmp/envguard-pwned; echo '"
+
+    command = envguard._dotenv_append_command(malicious_key, None, tmp_path)
+
+    assert shlex.split(command) == [
+        "printf",
+        "%s\\n",
+        f"{malicious_key}=",
+        ">>",
+        envguard._dotenv_plan_path(None, tmp_path),
+    ]
+
+
 def test_global_plan_path_enters_plan_mode_without_regular_scan_exit(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1528,6 +1543,43 @@ def test_global_plan_rejects_fix_and_write_baseline_before_side_effects(
 
     assert fix_exc.value.code == 2
     assert baseline_exc.value.code == 2
+    assert not baseline.exists()
+    assert not (tmp_path / ".env.example.bak").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--fix", "plan"],
+        ["--fix-dry-run", "plan"],
+        ["--write-baseline", "{baseline}", "plan"],
+    ],
+)
+def test_plan_command_rejects_side_effecting_flags_before_output(
+    argv: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=placeholder\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / ".envguard-baseline.json"
+    resolved_argv = [
+        str(baseline) if token == "{baseline}" else token for token in argv
+    ] + [str(tmp_path)]
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.main(resolved_argv)
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert captured.out == ""
+    assert "plan" in captured.err
     assert not baseline.exists()
     assert not (tmp_path / ".env.example.bak").exists()
 
