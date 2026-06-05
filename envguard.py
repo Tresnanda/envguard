@@ -147,6 +147,7 @@ class RemediationPlan:
     counts: dict[str, int]
     dotenv_path: Optional[Path] = None
     supabase_project: Optional[str] = None
+    supabase_checked: bool = False
     notes: List[str] = field(default_factory=list)
 
 
@@ -2176,7 +2177,8 @@ def _dotenv_append_command(key: str, dotenv_path: Optional[Path], scan_path: Pat
 
 def _supabase_set_command(key: str, project_ref: Optional[str]) -> str:
     ref = project_ref or "YOUR_PROJECT_REF"
-    return f"supabase secrets set {key}='{PLAN_PLACEHOLDER}' --project-ref {shlex.quote(ref)}"
+    key_arg = shlex.quote(key)
+    return f"supabase secrets set {key_arg}='{PLAN_PLACEHOLDER}' --project-ref {shlex.quote(ref)}"
 
 
 def _envguard_override_command(flag: str, key: str, scan_path: Path) -> str:
@@ -2189,7 +2191,7 @@ def _envguard_override_command(flag: str, key: str, scan_path: Path) -> str:
 
 def _supabase_unset_command(key: str, project_ref: Optional[str]) -> str:
     ref = project_ref or "YOUR_PROJECT_REF"
-    return f"supabase secrets unset {key} --project-ref {shlex.quote(ref)}"
+    return f"supabase secrets unset {shlex.quote(key)} --project-ref {shlex.quote(ref)}"
 
 
 def _plan_proposals_for_row(
@@ -2311,6 +2313,7 @@ def build_remediation_plan(matrix: SecretsMatrix, scan_path: Path) -> Remediatio
         },
         dotenv_path=matrix.dotenv_path,
         supabase_project=matrix.supabase_project,
+        supabase_checked=matrix.supabase_checked,
         notes=matrix.notes,
     )
 
@@ -2325,6 +2328,7 @@ def _plan_json_output(plan: RemediationPlan) -> None:
         "sources": {
             "dotenv": str(plan.dotenv_path) if plan.dotenv_path else None,
             "supabase_project": plan.supabase_project,
+            "supabase_checked": plan.supabase_checked,
         },
         "notes": [
             "Proposal-only remediation plan: no prompts, backups, dotenv writes, "
@@ -3533,6 +3537,16 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             if len(tokens) > 1:
                 parser.error("expected one project path")
             args.path = first
+
+    if args.plan:
+        if args.fix or args.fix_dry_run or args.write_baseline:
+            parser.error("--plan cannot be combined with fix modes or --write-baseline")
+        if args.command not in {None, "doctor", "plan"}:
+            parser.error(f"--plan is not supported with the {args.command} command")
+        if args.github_annotations:
+            parser.error("--plan is not supported with the ci command")
+        if args.command is None:
+            args.command = "plan"
 
     del args.tokens
     return args

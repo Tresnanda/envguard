@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -1441,6 +1442,113 @@ def test_plan_command_prints_redacted_copy_pasteable_actions_without_writes(
         for path in tmp_path.rglob("*")
         if path.is_file()
     } == before
+
+
+def test_plan_supabase_commands_quote_untrusted_key_names(tmp_path: Path) -> None:
+    malicious_key = "BAD_KEY; echo pwned"
+    malicious_orphan = "OLD_KEY; touch /tmp/pwned"
+    project_ref = "project-ref; rm -rf /"
+    matrix = envguard.SecretsMatrix(
+        rows=[
+            envguard.SecretsMatrixRow(
+                key=malicious_key,
+                requirement="required",
+                status="missing",
+                dotenv=False,
+                environment=False,
+                supabase=False,
+                references=1,
+            )
+        ],
+        supabase_project=project_ref,
+        supabase_checked=True,
+        supabase_orphans=[malicious_orphan],
+    )
+
+    plan = envguard.build_remediation_plan(matrix, tmp_path)
+    commands = [
+        proposal.command
+        for action in plan.actions
+        for proposal in action.proposals
+        if proposal.command and proposal.command.startswith("supabase secrets")
+    ]
+
+    assert shlex.split(commands[0]) == [
+        "supabase",
+        "secrets",
+        "set",
+        f"{malicious_key}=replace-me",
+        "--project-ref",
+        project_ref,
+    ]
+    assert shlex.split(commands[1]) == [
+        "supabase",
+        "secrets",
+        "unset",
+        malicious_orphan,
+        "--project-ref",
+        project_ref,
+    ]
+
+
+def test_global_plan_path_enters_plan_mode_without_regular_scan_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+
+    envguard.main(["--plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert "envguard plan" in output
+    assert "MISSING_SECRET" in output
+    assert "No files were written" in output
+
+
+def test_global_plan_rejects_fix_and_write_baseline_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=placeholder\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / ".envguard-baseline.json"
+
+    with pytest.raises(SystemExit) as fix_exc:
+        envguard.main(["--plan", "--fix", str(tmp_path)])
+    with pytest.raises(SystemExit) as baseline_exc:
+        envguard.main(["--plan", "--write-baseline", str(baseline), str(tmp_path)])
+
+    assert fix_exc.value.code == 2
+    assert baseline_exc.value.code == 2
+    assert not baseline.exists()
+    assert not (tmp_path / ".env.example.bak").exists()
+
+
+def test_plan_json_reports_supabase_checked_when_unchecked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SUPABASE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(envguard, "supabase_cli_available", lambda: False)
+
+    envguard.main(["--json", "--supabase-project", "project-ref", "plan", str(tmp_path)])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sources"]["supabase_project"] == "project-ref"
+    assert payload["sources"]["supabase_checked"] is False
 
 
 def test_doctor_plan_flag_uses_plan_mode_without_failing_for_missing(
