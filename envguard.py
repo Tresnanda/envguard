@@ -50,6 +50,76 @@ REPO_URL = "https://github.com/Tresnanda/envguard.git"
 REPO_SPEC = f"git+{REPO_URL}"
 MIN_PYTHON = (3, 9)
 
+DEFAULT_BUILTIN_PROFILES = ("github-actions", "shell", "ci")
+RUNTIME_BUILTIN_PROFILES: dict[str, tuple[str, ...]] = {
+    # GitHub-hosted runner variables are provided by Actions at runtime. Keep
+    # GITHUB_TOKEN out: it is a secret-like token users should wire explicitly.
+    "github-actions": (
+        "ACTIONS_CACHE_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_RUNTIME_URL",
+        "ACTIONS_STEP_DEBUG",
+        "GITHUB_ACTION",
+        "GITHUB_ACTION_PATH",
+        "GITHUB_ACTION_REPOSITORY",
+        "GITHUB_ACTIONS",
+        "GITHUB_ACTOR",
+        "GITHUB_ACTOR_ID",
+        "GITHUB_API_URL",
+        "GITHUB_BASE_REF",
+        "GITHUB_ENV",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_GRAPHQL_URL",
+        "GITHUB_HEAD_REF",
+        "GITHUB_JOB",
+        "GITHUB_OUTPUT",
+        "GITHUB_PATH",
+        "GITHUB_REF",
+        "GITHUB_REF_NAME",
+        "GITHUB_REF_PROTECTED",
+        "GITHUB_REF_TYPE",
+        "GITHUB_REPOSITORY",
+        "GITHUB_REPOSITORY_ID",
+        "GITHUB_REPOSITORY_OWNER",
+        "GITHUB_REPOSITORY_OWNER_ID",
+        "GITHUB_RETENTION_DAYS",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_NUMBER",
+        "GITHUB_SERVER_URL",
+        "GITHUB_SHA",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_TRIGGERING_ACTOR",
+        "GITHUB_WORKFLOW",
+        "GITHUB_WORKFLOW_REF",
+        "GITHUB_WORKFLOW_SHA",
+        "GITHUB_WORKSPACE",
+        "RUNNER_*",
+    ),
+    "shell": (
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "OLDPWD",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "SHLVL",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "XDG_*",
+    ),
+    "ci": (
+        "CI",
+    ),
+}
+
 
 # ─── Data Structures ───────────────────────────────────────────────────────
 
@@ -130,6 +200,7 @@ class EnvguardConfig:
     optional: List[str] = field(default_factory=list)
     external: List[str] = field(default_factory=list)
     ignore_missing: List[str] = field(default_factory=list)
+    builtin_profiles: List[str] = field(default_factory=lambda: list(DEFAULT_BUILTIN_PROFILES))
 
 
 @dataclass
@@ -949,6 +1020,43 @@ def _looks_generated_or_minified(path: Path) -> bool:
     return average_line_length > 500 or very_long_lines >= 3
 
 
+def normalize_builtin_profiles(profiles: Optional[List[str]]) -> List[str]:
+    """Return known built-in profile names in stable order without duplicates."""
+    if profiles is None:
+        profiles = list(DEFAULT_BUILTIN_PROFILES)
+
+    normalized: List[str] = []
+    for profile in profiles:
+        name = profile.strip().lower()
+        if name in RUNTIME_BUILTIN_PROFILES and name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
+def _matches_runtime_builtin(key: str, profile: str) -> bool:
+    """Return whether a key matches one built-in runtime profile pattern."""
+    return any(fnmatch(key, pattern) for pattern in RUNTIME_BUILTIN_PROFILES[profile])
+
+
+def runtime_builtin_profile_for_key(
+    key: str,
+    profiles: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Return the built-in runtime profile that owns a key, if any."""
+    for profile in normalize_builtin_profiles(profiles):
+        if _matches_runtime_builtin(key, profile):
+            return profile
+    return None
+
+
+def runtime_builtin_external_keys(
+    keys: set[str],
+    profiles: Optional[List[str]] = None,
+) -> List[str]:
+    """Return referenced keys supplied by selected built-in runtime profiles."""
+    return sorted(key for key in keys if runtime_builtin_profile_for_key(key, profiles))
+
+
 # ─── Project configuration ─────────────────────────────────────────────────
 
 
@@ -976,6 +1084,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
     optional = raw_config.get("optional", [])
     external = raw_config.get("external", [])
     ignore_missing = raw_config.get("ignore_missing", [])
+    builtin_profiles = raw_config.get("builtin_profiles", list(DEFAULT_BUILTIN_PROFILES))
 
     def list_of_strings(value: object) -> List[str]:
         return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
@@ -989,6 +1098,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
         optional=list_of_strings(optional),
         external=list_of_strings(external),
         ignore_missing=list_of_strings(ignore_missing),
+        builtin_profiles=normalize_builtin_profiles(list_of_strings(builtin_profiles)),
     )
 
 
@@ -1803,6 +1913,7 @@ def analyze(
     optional_keys: Optional[List[str]] = None,
     external_keys: Optional[List[str]] = None,
     ignore_keys: Optional[List[str]] = None,
+    builtin_profiles: Optional[List[str]] = None,
 ) -> ScanResult:
     """Cross-reference code references against expected keys."""
     result = ScanResult(references=ref_map)
@@ -1817,7 +1928,9 @@ def analyze(
 
     required_key_set: set[str] = set()
     optional_key_set: set[str] = set(optional_keys or [])
-    external_key_set: set[str] = set(external_keys or [])
+    external_key_set: set[str] = set(external_keys or []) | set(
+        runtime_builtin_external_keys(code_keys, builtin_profiles)
+    )
     ignored_key_set: set[str] = set(ignore_keys or [])
     for key, refs in ref_map.items():
         if key in ignored_key_set:
@@ -1892,6 +2005,7 @@ def build_secrets_matrix(
     optional_keys: Optional[List[str]] = None,
     external_keys: Optional[List[str]] = None,
     ignore_keys: Optional[List[str]] = None,
+    builtin_profiles: Optional[List[str]] = None,
     dotenv_path: Optional[Path] = None,
     supabase_project: Optional[str] = None,
     notes: Optional[List[str]] = None,
@@ -1902,7 +2016,9 @@ def build_secrets_matrix(
     supabase_set = set(supabase_keys or [])
     supabase_checked = supabase_keys is not None
     optional_set = set(optional_keys or [])
-    external_set = set(external_keys or [])
+    external_set = set(external_keys or []) | set(
+        runtime_builtin_external_keys(set(ref_map), builtin_profiles)
+    )
     ignored_set = set(ignore_keys or [])
 
     rows: List[SecretsMatrixRow] = []
@@ -3166,6 +3282,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ignore a missing key entirely. Can be repeated.",
     )
     parser.add_argument(
+        "--builtin-profile",
+        action="append",
+        default=None,
+        choices=sorted(RUNTIME_BUILTIN_PROFILES),
+        metavar="NAME",
+        help=(
+            "Runtime built-in profile to classify as external advisory "
+            "(default: github-actions, shell, ci). Can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--no-builtin-profiles",
+        action="store_true",
+        help="Disable built-in runtime variable profiles.",
+    )
+    parser.add_argument(
         "--allow-unused",
         action="store_true",
         help="Do not fail when unused .env.example keys or Supabase orphan secrets are found",
@@ -3283,6 +3415,11 @@ def main(argv: Optional[List[str]] = None):
         return
 
     config = load_project_config(scan_path)
+    builtin_profiles = [] if args.no_builtin_profiles else (
+        normalize_builtin_profiles(args.builtin_profile)
+        if args.builtin_profile is not None
+        else config.builtin_profiles
+    )
 
     # Determine dotenv path
     if args.dotenv:
@@ -3381,6 +3518,7 @@ def main(argv: Optional[List[str]] = None):
             optional_keys=config.optional + args.optional,
             external_keys=config.external + args.external,
             ignore_keys=config.ignore_missing + args.ignore_missing,
+            builtin_profiles=builtin_profiles,
             dotenv_path=dotenv_path if dotenv_path.exists() else None,
             supabase_project=supabase_project,
             notes=doctor_notes,
@@ -3398,6 +3536,7 @@ def main(argv: Optional[List[str]] = None):
         optional_keys=config.optional + args.optional,
         external_keys=config.external + args.external,
         ignore_keys=config.ignore_missing + args.ignore_missing,
+        builtin_profiles=builtin_profiles,
     )
 
     if args.write_baseline:

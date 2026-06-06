@@ -752,6 +752,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'optional = ["CLI_DEFAULT_BOT"]',
                 'external = ["REMOTE_CONTAINER_SECRET"]',
                 'ignore_missing = ["LEGACY_FLAG"]',
+                'builtin_profiles = ["github-actions"]',
             ]
         ),
         encoding="utf-8",
@@ -767,6 +768,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.optional == ["CLI_DEFAULT_BOT"]
     assert config.external == ["REMOTE_CONTAINER_SECRET"]
     assert config.ignore_missing == ["LEGACY_FLAG"]
+    assert config.builtin_profiles == ["github-actions"]
 
 
 def test_scan_supabase_false_excludes_local_functions_and_remote_fetch(
@@ -853,6 +855,66 @@ def test_analyze_honors_project_level_requirement_overrides() -> None:
     assert result.optional_missing == ["CLI_DEFAULT_BOT"]
     assert result.external_missing == ["REMOTE_CONTAINER_SECRET"]
     assert result.ignored_missing == ["LEGACY_FLAG"]
+
+
+def test_analyze_treats_runtime_builtins_as_external_advisory() -> None:
+    ref_map = {
+        "GITHUB_ENV": [
+            envguard.EnvReference(
+                key="GITHUB_ENV",
+                file=".github/workflows/ci.yml",
+                line=10,
+                pattern_type="$VAR",
+            )
+        ],
+        "RUNNER_TEMP": [
+            envguard.EnvReference(
+                key="RUNNER_TEMP",
+                file=".github/workflows/ci.yml",
+                line=11,
+                pattern_type="$VAR",
+            )
+        ],
+        "PATH": [
+            envguard.EnvReference(
+                key="PATH",
+                file="scripts/setup.sh",
+                line=3,
+                pattern_type="$VAR",
+            )
+        ],
+        "GITHUB_TOKEN": [
+            envguard.EnvReference(
+                key="GITHUB_TOKEN",
+                file=".github/workflows/ci.yml",
+                line=12,
+                pattern_type="$VAR",
+            )
+        ],
+    }
+
+    result = envguard.analyze(ref_map=ref_map, dotenv_keys=[])
+
+    assert result.missing == ["GITHUB_TOKEN"]
+    assert result.external_missing == ["GITHUB_ENV", "PATH", "RUNNER_TEMP"]
+
+
+def test_builtin_profiles_can_be_disabled() -> None:
+    ref_map = {
+        "GITHUB_OUTPUT": [
+            envguard.EnvReference(
+                key="GITHUB_OUTPUT",
+                file=".github/workflows/ci.yml",
+                line=7,
+                pattern_type="$VAR",
+            )
+        ]
+    }
+
+    result = envguard.analyze(ref_map=ref_map, dotenv_keys=[], builtin_profiles=[])
+
+    assert result.missing == ["GITHUB_OUTPUT"]
+    assert result.external_missing == []
 
 
 def test_github_annotations_include_file_line_and_messages() -> None:
