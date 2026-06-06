@@ -1091,6 +1091,48 @@ def _display_path(path: Path, base: Optional[Path] = None) -> str:
     return path.as_posix()
 
 
+def _repo_root_for_path(path: Path) -> Path:
+    """Return the repository root for path, falling back to the scan root."""
+    start = path if path.is_dir() else path.parent
+    git = shutil.which("git")
+    if git:
+        try:
+            result = subprocess.run(
+                [git, "-C", str(start), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result and result.returncode == 0:
+            root = result.stdout.strip()
+            if root:
+                return Path(root).resolve()
+
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+
+    return start.resolve()
+
+
+def _reference_output_path(file_path: str, reference_root: Optional[Path] = None) -> str:
+    """Return a repo-relative reference path when file_path is inside root."""
+    path = Path(file_path)
+    if reference_root is None or not path.is_absolute():
+        return path.as_posix()
+
+    root = reference_root.resolve()
+    resolved_path = path.resolve(strict=False)
+    try:
+        relative = resolved_path.relative_to(root)
+    except ValueError:
+        return path.as_posix()
+    return relative.as_posix() or "."
+
+
 def _is_safe_ci_dotenv(path: Path) -> bool:
     """Return True for dotenv templates that are reasonable to reference in CI."""
     return path.name in {".env.example", ".env.sample", ".env.template"}
@@ -2421,6 +2463,7 @@ def _json_output(
     allow_missing: bool = False,
     baseline_path: Optional[Path] = None,
     baseline_suppressed: Optional[dict[str, int]] = None,
+    reference_root: Optional[Path] = None,
 ) -> None:
     """JSON machine-readable output."""
     output = {
@@ -2440,7 +2483,7 @@ def _json_output(
         "references": {
             key: [
                 {
-                    "file": r.file,
+                    "file": _reference_output_path(r.file, reference_root),
                     "line": r.line,
                     "pattern": r.pattern_type,
                     "requirement": r.requirement,
@@ -2519,7 +2562,21 @@ def _escape_annotation_message(value: str) -> str:
     )
 
 
-def build_github_annotations(result: ScanResult) -> List[str]:
+def _escape_annotation_property(value: str) -> str:
+    """Escape a GitHub Actions annotation property value."""
+    return (
+        value.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+        .replace(":", "%3A")
+        .replace(",", "%2C")
+    )
+
+
+def build_github_annotations(
+    result: ScanResult,
+    reference_root: Optional[Path] = None,
+) -> List[str]:
     """Build GitHub Actions annotations for missing, unused, and orphaned keys."""
     annotations: List[str] = []
 
@@ -2527,9 +2584,12 @@ def build_github_annotations(result: ScanResult) -> List[str]:
         refs = result.references.get(key, [])
         if refs:
             for ref in refs:
+                file_path = _escape_annotation_property(
+                    _reference_output_path(ref.file, reference_root)
+                )
                 annotations.append(
                     (
-                        f"::error file={ref.file},line={ref.line}::"
+                        f"::error file={file_path},line={ref.line}::"
                         f"Missing environment variable {_escape_annotation_message(key)}"
                     )
                 )
@@ -2563,9 +2623,12 @@ def build_github_annotations(result: ScanResult) -> List[str]:
     return annotations
 
 
-def _github_annotations_output(result: ScanResult) -> None:
+def _github_annotations_output(
+    result: ScanResult,
+    reference_root: Optional[Path] = None,
+) -> None:
     """Print GitHub Actions annotations."""
-    for annotation in build_github_annotations(result):
+    for annotation in build_github_annotations(result, reference_root=reference_root):
         print(annotation)
 
 
@@ -3267,6 +3330,7 @@ def main(argv: Optional[List[str]] = None):
     if not scan_path.exists():
         print(f"Error: path does not exist: {scan_path}", file=sys.stderr)
         sys.exit(1)
+    reference_root = _repo_root_for_path(scan_path)
 
     if args.command == "init":
         config_path = write_project_config(
@@ -3418,7 +3482,7 @@ def main(argv: Optional[List[str]] = None):
 
     # ── Output ─────────────────────────────────────────────────────────────
     if args.github_annotations:
-        _github_annotations_output(result)
+        _github_annotations_output(result, reference_root=reference_root)
     elif args.json:
         _json_output(
             result,
@@ -3426,6 +3490,7 @@ def main(argv: Optional[List[str]] = None):
             allow_missing=args.allow_missing,
             baseline_path=baseline_path,
             baseline_suppressed=baseline_suppressed,
+            reference_root=reference_root,
         )
     elif args.summary:
         _summary_output(
@@ -3443,6 +3508,7 @@ def main(argv: Optional[List[str]] = None):
                 allow_missing=args.allow_missing,
                 baseline_path=baseline_path,
                 baseline_suppressed=baseline_suppressed,
+                reference_root=reference_root,
             )
         else:
             _rich_output(
