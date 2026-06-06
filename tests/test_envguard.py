@@ -1217,6 +1217,14 @@ def test_parse_cli_args_accepts_positional_path_and_presets() -> None:
     assert matrix.command == "doctor"
     assert matrix.path == "apps/api"
 
+    ownership = envguard.parse_cli_args(["ownership", "apps/worker"])
+    assert ownership.command == "ownership"
+    assert ownership.path == "apps/worker"
+
+    owners = envguard.parse_cli_args(["owners", "apps/site"])
+    assert owners.command == "ownership"
+    assert owners.path == "apps/site"
+
     summary = envguard.parse_cli_args(["--summary", "apps/web"])
     assert summary.summary is True
     assert summary.path == "apps/web"
@@ -1297,6 +1305,105 @@ def test_build_secrets_matrix_reports_sources_and_requirements_without_values(
     assert payload["rows"][0]["available"]["supabase"] in {True, False}
     assert "shell-secret" not in output
     assert "optional-secret" not in output
+
+
+def test_build_ownership_map_reports_provider_owners_without_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "vercel.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / "supabase" / "functions" / "api").mkdir(parents=True)
+
+    ref_map = {
+        "APP_SECRET": [envguard.EnvReference("APP_SECRET", "app.py", 1, "os.getenv")],
+        "DEPLOY_TOKEN": [
+            envguard.EnvReference(
+                "DEPLOY_TOKEN",
+                str(tmp_path / ".github" / "workflows" / "deploy.yml"),
+                2,
+                "github-actions secrets.KEY",
+            )
+        ],
+        "EDGE_SECRET": [
+            envguard.EnvReference(
+                "EDGE_SECRET",
+                str(tmp_path / "supabase" / "functions" / "api" / "index.ts"),
+                3,
+                "Deno.env.get",
+            )
+        ],
+        "VERCEL_URL": [envguard.EnvReference("VERCEL_URL", "app.ts", 4, "process.env.KEY")],
+    }
+
+    ownership = envguard.build_ownership_map(
+        ref_map,
+        dotenv_keys=["APP_SECRET", "VERCEL_URL", "UNUSED_DOTENV"],
+        env={"APP_SECRET": "APP_SECRET_VALUE_SHOULD_STAY_HIDDEN"},
+        supabase_keys=["EDGE_SECRET", "ORPHAN_EDGE_SECRET"],
+        dotenv_path=tmp_path / ".env.example",
+        supabase_project="project-ref",
+        scan_path=tmp_path,
+    )
+
+    rows = {row.key: row for row in ownership.rows}
+    assert rows["APP_SECRET"].owner == "vercel environment"
+    assert rows["APP_SECRET"].should_live_in == ["dotenv", "vercel environment"]
+    assert rows["DEPLOY_TOKEN"].owner == "github-actions secrets"
+    assert rows["EDGE_SECRET"].owner == "supabase secrets"
+    assert rows["EDGE_SECRET"].status == "mapped"
+    assert rows["VERCEL_URL"].owner == "vercel runtime"
+    assert rows["VERCEL_URL"].status == "runtime-built-in"
+    assert {orphan.key for orphan in ownership.orphaned} == {
+        "ORPHAN_EDGE_SECRET",
+        "UNUSED_DOTENV",
+        "VERCEL_URL",
+    }
+
+    envguard._ownership_json_output(ownership)
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    payload_rows = {row["key"]: row for row in payload["rows"]}
+    assert payload["summary"]["values"] == "hidden"
+    assert payload_rows["DEPLOY_TOKEN"]["should_live_in"] == ["github-actions secrets"]
+    assert payload_rows["VERCEL_URL"]["owner"] == "vercel runtime"
+    assert "APP_SECRET_VALUE_SHOULD_STAY_HIDDEN" not in output
+
+
+def test_ownership_command_prints_json_map_without_dotenv_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "vercel.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                'APP_SECRET = os.getenv("APP_SECRET")',
+                'VERCEL_URL = os.getenv("VERCEL_URL")',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "APP_SECRET=DOTENV_VALUE_SHOULD_STAY_HIDDEN\n"
+        "VERCEL_URL=BUILTIN_VALUE_SHOULD_STAY_HIDDEN\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APP_SECRET", "ENV_VALUE_SHOULD_STAY_HIDDEN")
+
+    envguard.main(["--json", "ownership", str(tmp_path)])
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    rows = {row["key"]: row for row in payload["rows"]}
+
+    assert rows["APP_SECRET"]["owner"] == "vercel environment"
+    assert rows["VERCEL_URL"]["owner"] == "vercel runtime"
+    assert payload["orphaned"][0]["key"] == "VERCEL_URL"
+    assert "DOTENV_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert "BUILTIN_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert "ENV_VALUE_SHOULD_STAY_HIDDEN" not in output
 
 
 def test_doctor_command_prints_json_matrix_without_dotenv_values(
