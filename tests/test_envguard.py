@@ -653,6 +653,79 @@ def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     assert result.supabase_orphans == ["LEGACY_SECRET"]
 
 
+def test_analyze_reports_advisory_key_typos_across_sources() -> None:
+    ref_map = {
+        "SUPABSE_URL": [
+            envguard.EnvReference(
+                key="SUPABSE_URL",
+                file="app.py",
+                line=7,
+                pattern_type="os.getenv",
+            )
+        ],
+        "EDGE_RUNER_SECRET": [
+            envguard.EnvReference(
+                key="EDGE_RUNER_SECRET",
+                file="supabase/functions/hello/index.ts",
+                line=2,
+                pattern_type="Deno.env.get",
+            )
+        ],
+    }
+
+    result = envguard.analyze(
+        ref_map=ref_map,
+        dotenv_keys=["SUPABASE_URL", "DATABASE_URL"],
+        supabase_keys=["EDGE_RUNNER_SECRET"],
+    )
+
+    assert result.key_typos == [
+        envguard.EnvKeyTypoSuggestion(
+            key="EDGE_RUNER_SECRET",
+            key_sources=["referenced"],
+            similar_key="EDGE_RUNNER_SECRET",
+            similar_key_sources=["supabase"],
+            distance=1,
+        ),
+        envguard.EnvKeyTypoSuggestion(
+            key="SUPABASE_URL",
+            key_sources=["dotenv"],
+            similar_key="SUPABSE_URL",
+            similar_key_sources=["referenced"],
+            distance=1,
+        ),
+    ]
+    assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
+
+
+def test_json_output_includes_secret_safe_key_typo_advisories(capsys) -> None:
+    result = envguard.ScanResult(
+        key_typos=[
+            envguard.EnvKeyTypoSuggestion(
+                key="SUPABASE_URL",
+                key_sources=["dotenv"],
+                similar_key="SUPABSE_URL",
+                similar_key_sources=["referenced"],
+                distance=1,
+            )
+        ]
+    )
+
+    envguard._json_output(result)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["key_typos"] == [
+        {
+            "key": "SUPABASE_URL",
+            "sources": ["dotenv"],
+            "similar_key": "SUPABSE_URL",
+            "similar_sources": ["referenced"],
+            "distance": 1,
+        }
+    ]
+    assert payload["summary"]["blocking"] is False
+
+
 def test_detect_references_classifies_optional_defaults_and_embedded_runtime_context(
     tmp_path: Path,
 ) -> None:
@@ -1158,6 +1231,22 @@ def test_summary_output_includes_baselined_findings() -> None:
         envguard.ScanResult(),
         baseline_suppressed={"missing": 1, "unused": 1},
     ) == "envguard: green — 2 baselined (exit 0)"
+
+
+def test_summary_output_marks_key_typos_as_nonblocking_advisory() -> None:
+    result = envguard.ScanResult(
+        key_typos=[
+            envguard.EnvKeyTypoSuggestion(
+                key="SUPABASE_URL",
+                key_sources=["dotenv"],
+                similar_key="SUPABSE_URL",
+                similar_key_sources=["referenced"],
+                distance=1,
+            )
+        ]
+    )
+
+    assert envguard.format_summary_line(result) == "envguard: yellow — 1 typo (exit 0)"
 
 
 def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
