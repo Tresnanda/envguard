@@ -954,6 +954,30 @@ def test_sarif_output_uses_relative_locations_when_available(tmp_path: Path) -> 
     assert unused_location["region"]["startLine"] == 2
 
 
+def test_sarif_output_uses_file_name_for_single_file_scan(tmp_path: Path) -> None:
+    src = tmp_path / "app.py"
+    src.write_text("import os\nvalue = os.getenv('MISSING_KEY')\n", encoding="utf-8")
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file=str(src),
+                    line=2,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        missing=["MISSING_KEY"],
+    )
+
+    results = envguard.build_sarif_log(result, src)["runs"][0]["results"]
+    location = results[0]["locations"][0]["physicalLocation"]
+
+    assert location["artifactLocation"]["uri"] == "app.py"
+    assert location["region"]["startLine"] == 2
+
+
 def test_sarif_output_does_not_include_secret_values(tmp_path: Path, capsys) -> None:
     dotenv = tmp_path / ".env.example"
     dotenv.write_text("OLD_SECRET=super-secret-value\n", encoding="utf-8")
@@ -972,6 +996,12 @@ def test_sarif_output_does_not_include_secret_values(tmp_path: Path, capsys) -> 
         "envguard.unused",
     }
     assert "super-secret-value" not in output
+    assert "DATABASE_URL = os.getenv" not in output
+    for finding in sarif["runs"][0]["results"]:
+        for location in finding.get("locations", []):
+            region = location.get("physicalLocation", {}).get("region", {})
+            assert "snippet" not in region
+            assert "text" not in region
 
 
 def test_rich_output_hides_missing_reference_table_by_default(capsys) -> None:

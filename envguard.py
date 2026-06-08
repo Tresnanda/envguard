@@ -2584,7 +2584,11 @@ def build_sarif_log(
     it reports key names, rule metadata, and locations when available, but never
     includes dotenv/environment/Supabase secret values or source snippets.
     """
-    base_path = scan_path.resolve() if scan_path is not None else None
+    if scan_path is not None:
+        resolved_scan_path = scan_path.resolve()
+        base_path = resolved_scan_path if resolved_scan_path.is_dir() else resolved_scan_path.parent
+    else:
+        base_path = None
     dotenv_lines = _dotenv_key_lines(dotenv_path)
     sarif_results: list[dict[str, object]] = []
 
