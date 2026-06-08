@@ -881,6 +881,99 @@ def test_github_annotations_include_file_line_and_messages() -> None:
     ]
 
 
+def test_sarif_output_includes_schema_rules_and_results(tmp_path: Path) -> None:
+    dotenv = tmp_path / ".env.example"
+    dotenv.write_text("OLD_KEY=not-a-secret\n", encoding="utf-8")
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file=str(tmp_path / "src" / "app.py"),
+                    line=12,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+        supabase_orphans=["LEGACY_SECRET"],
+    )
+
+    sarif = envguard.build_sarif_log(result, scan_path=tmp_path, dotenv_path=dotenv)
+    run = sarif["runs"][0]
+    rules = {rule["id"]: rule for rule in run["tool"]["driver"]["rules"]}
+    results = run["results"]
+
+    assert sarif["version"] == "2.1.0"
+    assert sarif["$schema"].endswith("sarif-2.1.0.json")
+    assert run["tool"]["driver"]["name"] == "envguard"
+    assert set(rules) == {
+        "envguard.missing",
+        "envguard.unused",
+        "envguard.supabase-orphan",
+    }
+    assert [finding["ruleId"] for finding in results] == [
+        "envguard.missing",
+        "envguard.unused",
+        "envguard.supabase-orphan",
+    ]
+    assert results[0]["level"] == "error"
+    assert results[1]["level"] == "warning"
+    assert results[2]["level"] == "warning"
+
+
+def test_sarif_output_uses_relative_locations_when_available(tmp_path: Path) -> None:
+    src = tmp_path / "src" / "app.py"
+    src.parent.mkdir()
+    src.write_text("import os\nvalue = os.getenv('MISSING_KEY')\n", encoding="utf-8")
+    dotenv = tmp_path / ".env.example"
+    dotenv.write_text("# config\nOLD_KEY=value\n", encoding="utf-8")
+    result = envguard.ScanResult(
+        references={
+            "MISSING_KEY": [
+                envguard.EnvReference(
+                    key="MISSING_KEY",
+                    file=str(src),
+                    line=2,
+                    pattern_type="os.getenv",
+                )
+            ]
+        },
+        unused=["OLD_KEY"],
+        missing=["MISSING_KEY"],
+    )
+
+    results = envguard.build_sarif_log(result, tmp_path, dotenv)["runs"][0]["results"]
+    missing_location = results[0]["locations"][0]["physicalLocation"]
+    unused_location = results[1]["locations"][0]["physicalLocation"]
+
+    assert missing_location["artifactLocation"]["uri"] == "src/app.py"
+    assert missing_location["region"]["startLine"] == 2
+    assert unused_location["artifactLocation"]["uri"] == ".env.example"
+    assert unused_location["region"]["startLine"] == 2
+
+
+def test_sarif_output_does_not_include_secret_values(tmp_path: Path, capsys) -> None:
+    dotenv = tmp_path / ".env.example"
+    dotenv.write_text("OLD_SECRET=super-secret-value\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text(
+        "import os\nDATABASE_URL = os.getenv('DATABASE_URL')\n",
+        encoding="utf-8",
+    )
+
+    envguard.main(["--sarif", "--allow-unused", "--allow-missing", str(tmp_path)])
+    output = capsys.readouterr().out
+    sarif = json.loads(output)
+
+    assert sarif["version"] == "2.1.0"
+    assert {finding["ruleId"] for finding in sarif["runs"][0]["results"]} == {
+        "envguard.missing",
+        "envguard.unused",
+    }
+    assert "super-secret-value" not in output
+
+
 def test_rich_output_hides_missing_reference_table_by_default(capsys) -> None:
     result = envguard.ScanResult(
         references={
