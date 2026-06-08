@@ -1476,6 +1476,21 @@ def test_write_project_config_refuses_symlinked_pyproject(tmp_path: Path) -> Non
     assert target.read_text(encoding="utf-8") == original
 
 
+def test_write_project_config_refuses_without_no_follow_support(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = \"keep-me\"\n"
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.delattr(envguard.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(OSError, match="without no-follow protection"):
+        envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert pyproject.read_text(encoding="utf-8") == original
+
+
 def test_write_project_config_atomic_write_replaces_swapped_symlink_not_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1038,6 +1038,10 @@ def write_project_config(
         _atomic_write_no_follow(pyproject_path, new_block, 0o644)
         return pyproject_path
     except OSError as exc:
+        if "O_NOFOLLOW is unavailable" in str(exc):
+            raise OSError(
+                f"Refusing to update pyproject.toml without no-follow protection: {pyproject_path}"
+            ) from exc
         raise OSError(f"Refusing to update non-regular pyproject.toml: {pyproject_path}") from exc
 
     pattern = re.compile(r"(?ms)^\[tool\.envguard\]\n.*?(?=^\[|\Z)")
@@ -2644,8 +2648,15 @@ def _write_backup_exclusive(path: Path, content: str) -> Path:
 
 
 def _no_follow_flags(flags: int) -> int:
-    """Add O_NOFOLLOW when the platform exposes it."""
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    """Add O_NOFOLLOW, failing closed when unavailable.
+
+    The callers use this for user-controlled config/dotenv write paths. Falling
+    back to plain open() would silently follow a swapped final-component symlink,
+    so platforms without O_NOFOLLOW must refuse the hardened operation instead.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("Refusing no-follow file operation: O_NOFOLLOW is unavailable")
     return flags | no_follow
 
 
