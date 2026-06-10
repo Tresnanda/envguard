@@ -3640,6 +3640,226 @@ def _json_output(
     print(json.dumps(output, indent=2))
 
 
+SARIF_VERSION = "2.1.0"
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+SARIF_RULES = {
+    "envguard.missing": {
+        "name": "Missing environment variable",
+        "short": "Referenced environment variable is absent from configuration",
+        "full": (
+            "A required environment variable is referenced in code but was not found "
+            "in the selected dotenv contract or Supabase secrets."
+        ),
+        "level": "error",
+    },
+    "envguard.unused": {
+        "name": "Unused environment variable",
+        "short": "Configured environment variable is not referenced in code",
+        "full": (
+            "An environment variable appears in the selected dotenv contract but "
+            "was not found in scanned source references."
+        ),
+        "level": "warning",
+    },
+    "envguard.supabase-orphan": {
+        "name": "Orphaned Supabase secret",
+        "short": "Supabase secret is not referenced locally",
+        "full": (
+            "A Supabase secret exists remotely but was not found in scanned source "
+            "references or the selected dotenv contract."
+        ),
+        "level": "warning",
+    },
+}
+
+
+def _sarif_rules() -> list[dict[str, object]]:
+    """Build SARIF rule descriptors for envguard findings."""
+    return [
+        {
+            "id": rule_id,
+            "name": details["name"],
+            "shortDescription": {"text": details["short"]},
+            "fullDescription": {"text": details["full"]},
+            "helpUri": REPO_URL,
+            "properties": {
+                "tags": ["configuration", "environment-variables", "secrets"],
+                "precision": "high",
+            },
+        }
+        for rule_id, details in SARIF_RULES.items()
+    ]
+
+
+def _sarif_uri(path: str | Path, base_path: Optional[Path] = None) -> str:
+    """Return a SARIF artifact URI, preferring paths relative to the scan root."""
+    path_obj = path if isinstance(path, Path) else Path(path)
+    if base_path is not None:
+        try:
+            if path_obj.is_absolute():
+                return path_obj.resolve().relative_to(base_path.resolve()).as_posix() or "."
+            return path_obj.as_posix() or "."
+        except (OSError, ValueError):
+            pass
+    return path_obj.as_posix() or "."
+
+
+def _sarif_location(
+    path: str | Path,
+    line: Optional[int] = None,
+    *,
+    base_path: Optional[Path] = None,
+) -> dict[str, object]:
+    """Build a SARIF physical location without reading or emitting source text."""
+    physical_location: dict[str, object] = {
+        "artifactLocation": {"uri": _sarif_uri(path, base_path)},
+    }
+    if line is not None and line > 0:
+        physical_location["region"] = {"startLine": line}
+    return {"physicalLocation": physical_location}
+
+
+def _dotenv_key_lines(dotenv_path: Optional[Path]) -> dict[str, int]:
+    """Map dotenv keys to first line number without exposing dotenv values."""
+    if dotenv_path is None or not dotenv_path.exists():
+        return {}
+    try:
+        text = dotenv_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    key_lines: dict[str, int] = {}
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(
+            r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*.*)?$",
+            stripped,
+        )
+        if match and match.group(1) not in key_lines:
+            key_lines[match.group(1)] = lineno
+    return key_lines
+
+
+def _sarif_result(
+    rule_id: str,
+    key: str,
+    message: str,
+    locations: Optional[list[dict[str, object]]] = None,
+) -> dict[str, object]:
+    """Build a SARIF result that includes key names but never secret values."""
+    finding: dict[str, object] = {
+        "ruleId": rule_id,
+        "level": str(SARIF_RULES[rule_id]["level"]),
+        "message": {"text": message},
+    }
+    if locations:
+        finding["locations"] = locations
+    return finding
+
+
+def build_sarif_log(
+    result: ScanResult,
+    scan_path: Optional[Path] = None,
+    dotenv_path: Optional[Path] = None,
+) -> dict[str, object]:
+    """Build a SARIF 2.1.0 log for missing, unused, and orphaned findings.
+
+    The log is intentionally a formatter-only view over existing scan results:
+    it reports key names, rule metadata, and locations when available, but never
+    includes dotenv/environment/Supabase secret values or source snippets.
+    """
+    if scan_path is not None:
+        resolved_scan_path = scan_path.resolve()
+        base_path = resolved_scan_path if resolved_scan_path.is_dir() else resolved_scan_path.parent
+    else:
+        base_path = None
+    dotenv_lines = _dotenv_key_lines(dotenv_path)
+    sarif_results: list[dict[str, object]] = []
+
+    for key in result.missing:
+        refs = result.references.get(key, [])
+        if refs:
+            for ref in refs:
+                sarif_results.append(
+                    _sarif_result(
+                        "envguard.missing",
+                        key,
+                        f"Missing environment variable {key}",
+                        [
+                            _sarif_location(
+                                ref.file,
+                                ref.line,
+                                base_path=base_path,
+                            )
+                        ],
+                    )
+                )
+        else:
+            sarif_results.append(
+                _sarif_result(
+                    "envguard.missing",
+                    key,
+                    f"Missing environment variable {key}",
+                )
+            )
+
+    for key in result.unused:
+        locations = None
+        if dotenv_path is not None and key in dotenv_lines:
+            locations = [
+                _sarif_location(
+                    dotenv_path,
+                    dotenv_lines[key],
+                    base_path=base_path,
+                )
+            ]
+        sarif_results.append(
+            _sarif_result(
+                "envguard.unused",
+                key,
+                f"Unused environment variable {key}",
+                locations,
+            )
+        )
+
+    for key in result.supabase_orphans:
+        sarif_results.append(
+            _sarif_result(
+                "envguard.supabase-orphan",
+                key,
+                f"Orphaned Supabase secret {key}",
+            )
+        )
+
+    return {
+        "$schema": SARIF_SCHEMA,
+        "version": SARIF_VERSION,
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": APP_NAME,
+                        "informationUri": REPO_URL,
+                        "rules": _sarif_rules(),
+                    }
+                },
+                "results": sarif_results,
+            }
+        ],
+    }
+
+
+def _sarif_output(
+    result: ScanResult,
+    scan_path: Optional[Path] = None,
+    dotenv_path: Optional[Path] = None,
+) -> None:
+    """Print SARIF 2.1.0 machine-readable output."""
+    print(json.dumps(build_sarif_log(result, scan_path, dotenv_path), indent=2))
+
+
 def _count_phrase(count: int, label: str) -> str:
     """Return a compact count phrase for summary output."""
     return f"{count} {label}"
@@ -4261,6 +4481,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard init                      Write [tool.envguard] defaults\n"
             "  envguard update                    Update envguard from GitHub\n"
             "  envguard --json                    Machine-readable output\n"
+            "  envguard --sarif                   SARIF output for GitHub Code Scanning\n"
             "  envguard --summary                 One-line terminal summary\n"
             "  envguard --baseline .envguard-baseline.json\n"
             "                                    Suppress known findings\n"
@@ -4288,6 +4509,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Output in JSON format (machine-readable)",
+    )
+    parser.add_argument(
+        "--sarif",
+        action="store_true",
+        help="Output SARIF 2.1.0 for GitHub Code Scanning",
     )
     parser.add_argument(
         "--summary",
@@ -4713,7 +4939,9 @@ def main(argv: Optional[List[str]] = None):
         baseline_suppressed = apply_baseline(result, load_baseline(baseline_path))
 
     # ── Output ─────────────────────────────────────────────────────────────
-    if args.github_annotations:
+    if args.sarif:
+        _sarif_output(result, scan_path=scan_path, dotenv_path=dotenv_path)
+    elif args.github_annotations:
         _github_annotations_output(result, reference_root=reference_root)
     elif args.json:
         _json_output(
