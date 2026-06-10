@@ -165,6 +165,93 @@ def test_detect_references_finds_modern_js_framework_env_patterns(
     }
 
 
+def test_detect_references_finds_js_runtime_env_expansions(tmp_path: Path) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "\n".join(
+            [
+                "const {",
+                "  DATABASE_URL,",
+                "  API_KEY: apiKey,",
+                "} = process.env;",
+                "const bunPublic = Bun.env.PUBLIC_URL;",
+                "const bunSecret = Bun.env['BUN_SECRET'];",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("DATABASE_URL", 2, "process.env destructuring"),
+        ("API_KEY", 3, "process.env destructuring"),
+        ("PUBLIC_URL", 5, "Bun.env.KEY"),
+        ("BUN_SECRET", 6, 'Bun.env["KEY"]'),
+    }
+
+
+def test_detect_references_finds_process_env_destructuring_after_unrelated_braces(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "function f() { return { x: 1 }; }\nconst { DATABASE_URL } = process.env;",
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("DATABASE_URL", 2, "process.env destructuring"),
+    }
+
+
+def test_detect_references_classifies_process_env_destructuring_defaults_optional(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "\n".join(
+            [
+                'const { DATABASE_URL = "sqlite" } = process.env;',
+                'const { API_KEY: apiKey = "test-key" } = process.env;',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.requirement, ref.reason) for ref in refs} == {
+        ("DATABASE_URL", "optional", "inline default or guard"),
+        ("API_KEY", "optional", "inline default or guard"),
+    }
+
+
+def test_detect_references_classifies_bun_env_inside_raw_template_as_external(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "launcher.ts"
+    source.write_text(
+        "\n".join(
+            [
+                "const local = Bun.env.LOCAL_SECRET;",
+                "const script = `",
+                "console.log(Bun.env.REMOTE_SECRET, Bun.env['REMOTE_TOKEN']);",
+                "`;",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = {ref.key: ref for ref in envguard.detect_references(source)}
+
+    assert refs["LOCAL_SECRET"].requirement == "required"
+    assert refs["REMOTE_SECRET"].requirement == "external"
+    assert refs["REMOTE_TOKEN"].requirement == "external"
+
+
 def test_detect_references_finds_zod_process_env_schema_keys(tmp_path: Path) -> None:
     source = tmp_path / "config.ts"
     source.write_text(
@@ -370,10 +457,19 @@ def test_scan_directory_skips_generated_mobile_and_bundle_noise(tmp_path: Path) 
         tmp_path / "ios" / "Pods" / "Headers" / "Generated.hpp",
         tmp_path / "assets" / "codemirror" / "cm.bundle.js.txt",
         tmp_path / "docs" / "plan.md",
+        tmp_path / "generated" / "runtime.ts",
+        tmp_path / "__generated__" / "bun.ts",
     ]
     for generated in generated_files:
         generated.parent.mkdir(parents=True, exist_ok=True)
-        generated.write_text("`${fake}` $noise %MORE_NOISE%\n", encoding="utf-8")
+        generated.write_text(
+            (
+                "`${fake}` $noise %MORE_NOISE%\n"
+                "const { GENERATED_SECRET } = process.env;\n"
+                "const bun = Bun.env.GENERATED_BUN_SECRET;\n"
+            ),
+            encoding="utf-8",
+        )
 
     refs = envguard.scan_directory(tmp_path)
 
