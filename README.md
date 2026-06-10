@@ -136,6 +136,15 @@ envguard matrix apps/web --json
 
 The doctor/matrix command is opt-in and reports one row per referenced key with its requirement class (`required`, `optional`, `external`, or `ignored`), whether the key name is present in the selected dotenv file, the current process environment, and fetched Supabase secrets, plus a readiness status. It never prints dotenv values, shell environment values, Supabase token values, or Supabase secret values. It exits non-zero when a required key is missing from all checked sources unless `--allow-missing` is used.
 
+Map provider ownership for referenced key names without fetching or printing secret values:
+
+```bash
+envguard ownership
+envguard owners apps/web --json
+```
+
+The ownership map shows each key name, its inferred owner, where it should live, where the key name was observed, and orphaned-looking names. It recognizes source/owner contexts such as Supabase Edge Function secrets, GitHub Actions `secrets.KEY` references, Vercel/Netlify/Cloudflare project config, dotenv templates, the current process environment, and well-known runtime built-ins like `GITHUB_*`, `VERCEL_*`, `NETLIFY`, and `CF_PAGES_*`. Provider CLIs are not queried for values; Supabase remote names are included only through the same opt-in/auto-safe secret-name checks used by `doctor`.
+
 Print a proposal-only remediation plan for missing or orphaned secret findings:
 
 ```bash

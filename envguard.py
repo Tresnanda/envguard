@@ -225,6 +225,41 @@ class SecretsMatrix:
 
 
 @dataclass
+class OwnershipRow:
+    """Provider ownership guidance for one environment key name."""
+
+    key: str
+    owner: str
+    should_live_in: List[str]
+    observed_in: List[str]
+    requirement: str
+    status: str
+    references: int
+
+
+@dataclass
+class OwnershipOrphan:
+    """A key name that looks present in a source without a matching owner/reference."""
+
+    key: str
+    observed_in: str
+    reason: str
+
+
+@dataclass
+class OwnershipMap:
+    """Secret-safe provider ownership report. It contains key names only."""
+
+    rows: List[OwnershipRow]
+    providers: List[str]
+    orphaned: List[OwnershipOrphan] = field(default_factory=list)
+    dotenv_path: Optional[Path] = None
+    supabase_project: Optional[str] = None
+    supabase_checked: bool = False
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
 class RemediationProposal:
     """One dry, copy-pasteable remediation suggestion."""
 
@@ -2354,6 +2389,293 @@ def build_secrets_matrix(
     )
 
 
+RUNTIME_BUILTIN_EXACT_OWNERS: dict[str, str] = {
+    "CI": "runtime built-ins",
+    "NODE_ENV": "runtime built-ins",
+    "PORT": "runtime built-ins",
+    "PATH": "runtime built-ins",
+    "HOME": "runtime built-ins",
+    "PWD": "runtime built-ins",
+    "GITHUB_ACTIONS": "github-actions runtime",
+    "RUNNER_OS": "github-actions runtime",
+    "VERCEL": "vercel runtime",
+    "VERCEL_ENV": "vercel runtime",
+    "VERCEL_URL": "vercel runtime",
+    "VERCEL_PROJECT_PRODUCTION_URL": "vercel runtime",
+    "VERCEL_REGION": "vercel runtime",
+    "NETLIFY": "netlify runtime",
+    "CONTEXT": "netlify runtime",
+    "URL": "netlify runtime",
+    "DEPLOY_URL": "netlify runtime",
+    "DEPLOY_PRIME_URL": "netlify runtime",
+    "BRANCH": "netlify runtime",
+    "HEAD": "netlify runtime",
+    "COMMIT_REF": "netlify runtime",
+    "REVIEW_ID": "netlify runtime",
+    "PULL_REQUEST": "netlify runtime",
+    "CF_PAGES": "cloudflare runtime",
+    "CF_PAGES_BRANCH": "cloudflare runtime",
+    "CF_PAGES_COMMIT_SHA": "cloudflare runtime",
+    "CF_PAGES_URL": "cloudflare runtime",
+}
+
+
+RUNTIME_BUILTIN_PREFIX_OWNERS: tuple[tuple[str, str], ...] = (
+    ("GITHUB_", "github-actions runtime"),
+    ("RUNNER_", "github-actions runtime"),
+    ("ACTIONS_", "github-actions runtime"),
+    ("VERCEL_GIT_", "vercel runtime"),
+    ("CF_PAGES_", "cloudflare runtime"),
+)
+
+
+DEPLOYMENT_PROVIDER_CONFIGS: dict[str, tuple[str, ...]] = {
+    "vercel": ("vercel.json", ".vercel/project.json"),
+    "netlify": ("netlify.toml",),
+    "cloudflare": ("wrangler.toml", "wrangler.json", "wrangler.jsonc"),
+}
+
+
+def runtime_builtin_owner(key: str) -> Optional[str]:
+    """Return the provider/runtime that injects a well-known built-in key."""
+    owner = RUNTIME_BUILTIN_EXACT_OWNERS.get(key)
+    if owner:
+        return owner
+    for prefix, prefix_owner in RUNTIME_BUILTIN_PREFIX_OWNERS:
+        if key.startswith(prefix):
+            return prefix_owner
+    return None
+
+
+def detect_deployment_providers(scan_path: Path) -> List[str]:
+    """Detect deployment providers from local config filenames only."""
+    providers: List[str] = []
+    for provider, relative_paths in DEPLOYMENT_PROVIDER_CONFIGS.items():
+        if any((scan_path / relative_path).exists() for relative_path in relative_paths):
+            providers.append(provider)
+    if (scan_path / ".github" / "workflows").exists():
+        providers.append("github-actions")
+    if has_supabase_edge_functions(scan_path):
+        providers.append("supabase")
+    return providers
+
+
+def _ref_path_parts(ref: EnvReference, scan_path: Path) -> tuple[str, ...]:
+    try:
+        path = Path(ref.file).resolve().relative_to(scan_path.resolve())
+    except (OSError, ValueError):
+        path = Path(ref.file)
+    return tuple(part.lower() for part in path.parts)
+
+
+def _is_supabase_edge_reference(ref: EnvReference, scan_path: Path) -> bool:
+    parts = _ref_path_parts(ref, scan_path)
+    return len(parts) >= 2 and parts[0] == "supabase" and parts[1] == "functions"
+
+
+def _append_unique(items: List[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def _ownership_targets_for_key(
+    key: str,
+    refs: List[EnvReference],
+    scan_path: Path,
+    detected_providers: List[str],
+    supabase_set: set[str],
+) -> List[str]:
+    builtin_owner = runtime_builtin_owner(key)
+    if builtin_owner:
+        return [builtin_owner]
+
+    targets: List[str] = []
+    if any(ref.pattern_type == "github-actions secrets.KEY" for ref in refs):
+        _append_unique(targets, "github-actions secrets")
+    if any(ref.pattern_type == "github-actions env.KEY" for ref in refs):
+        _append_unique(targets, "github-actions env")
+    if any(ref.pattern_type == "github-actions secrets.KEY" for ref in refs) or any(
+        ref.pattern_type == "github-actions env.KEY" for ref in refs
+    ):
+        return targets
+    if key in supabase_set or any(_is_supabase_edge_reference(ref, scan_path) for ref in refs):
+        _append_unique(targets, "supabase secrets")
+
+    deployment_targets = {
+        "vercel": "vercel environment",
+        "netlify": "netlify environment",
+        "cloudflare": "cloudflare environment",
+    }
+    for provider, target in deployment_targets.items():
+        if provider in detected_providers:
+            _append_unique(targets, target)
+
+    if not targets:
+        targets.append("dotenv")
+    elif "github-actions secrets" not in targets and "github-actions env" not in targets:
+        # Deployment and Supabase-owned keys still benefit from a dotenv template
+        # placeholder for local development and documentation.
+        targets.insert(0, "dotenv")
+    return targets
+
+
+def _observed_locations_for_key(
+    key: str,
+    dotenv_set: set[str],
+    env_set: set[str],
+    supabase_set: set[str],
+    supabase_checked: bool,
+    refs: List[EnvReference],
+) -> List[str]:
+    observed: List[str] = []
+    if key in dotenv_set:
+        observed.append("dotenv")
+    if key in env_set:
+        observed.append("current environment")
+    if supabase_checked and key in supabase_set:
+        observed.append("supabase secrets")
+    if any(ref.pattern_type == "github-actions secrets.KEY" for ref in refs):
+        observed.append("github-actions workflow reference")
+    if not observed:
+        observed.append("not observed")
+    return observed
+
+
+def _ownership_status(
+    key: str,
+    requirement: str,
+    targets: List[str],
+    observed: List[str],
+    supabase_checked: bool,
+) -> str:
+    builtin_owner = runtime_builtin_owner(key)
+    if builtin_owner:
+        return "runtime-built-in"
+    observed_set = set(observed)
+    targets_set = set(targets)
+    if targets_set & observed_set:
+        return "mapped"
+    if "supabase secrets" in targets_set and not supabase_checked:
+        return "unverified"
+    if any(target.endswith(" environment") for target in targets):
+        return "provider-unverified"
+    if requirement == "required":
+        return "missing"
+    return f"{requirement}-missing"
+
+
+def build_ownership_map(
+    ref_map: Dict[str, List[EnvReference]],
+    dotenv_keys: List[str],
+    env: Mapping[str, str],
+    supabase_keys: Optional[List[str]] = None,
+    optional_keys: Optional[List[str]] = None,
+    external_keys: Optional[List[str]] = None,
+    ignore_keys: Optional[List[str]] = None,
+    dotenv_path: Optional[Path] = None,
+    supabase_project: Optional[str] = None,
+    scan_path: Optional[Path] = None,
+    notes: Optional[List[str]] = None,
+) -> OwnershipMap:
+    """Build a provider ownership map using key names only."""
+    root = scan_path or Path.cwd()
+    dotenv_set = set(dotenv_keys)
+    env_set = set(env.keys())
+    supabase_set = set(supabase_keys or [])
+    supabase_checked = supabase_keys is not None
+    optional_set = set(optional_keys or [])
+    external_set = set(external_keys or [])
+    ignored_set = set(ignore_keys or [])
+    detected_providers = detect_deployment_providers(root)
+
+    rows: List[OwnershipRow] = []
+    for key in sorted(ref_map):
+        refs = ref_map[key]
+        requirement = _requirement_for_key(key, refs, optional_set, external_set, ignored_set)
+        targets = _ownership_targets_for_key(
+            key,
+            refs,
+            root,
+            detected_providers,
+            supabase_set,
+        )
+        observed = _observed_locations_for_key(
+            key,
+            dotenv_set,
+            env_set,
+            supabase_set,
+            supabase_checked,
+            refs,
+        )
+        owner = next((target for target in targets if target != "dotenv"), targets[0])
+        rows.append(
+            OwnershipRow(
+                key=key,
+                owner=owner,
+                should_live_in=targets,
+                observed_in=observed,
+                requirement=requirement,
+                status=_ownership_status(
+                    key,
+                    requirement,
+                    targets,
+                    observed,
+                    supabase_checked,
+                ),
+                references=len(refs),
+            )
+        )
+
+    orphaned: List[OwnershipOrphan] = []
+    referenced = set(ref_map)
+    for key in sorted(dotenv_set - referenced):
+        orphaned.append(
+            OwnershipOrphan(
+                key=key,
+                observed_in="dotenv",
+                reason="present in dotenv but not referenced in scanned code",
+            )
+        )
+    if supabase_checked:
+        for key in sorted(supabase_set - referenced - dotenv_set):
+            orphaned.append(
+                OwnershipOrphan(
+                    key=key,
+                    observed_in="supabase secrets",
+                    reason="present in Supabase secrets but not referenced or documented",
+                )
+            )
+    for key in sorted(dotenv_set & referenced):
+        owner = runtime_builtin_owner(key)
+        if owner:
+            orphaned.append(
+                OwnershipOrphan(
+                    key=key,
+                    observed_in="dotenv",
+                    reason=f"{owner} injects this key at runtime",
+                )
+            )
+
+    providers = sorted(
+        {
+            "dotenv",
+            "current environment",
+            *(detected_providers or []),
+            *("supabase" if supabase_project else "",),
+        }
+        - {""}
+    )
+    return OwnershipMap(
+        rows=rows,
+        providers=providers,
+        orphaned=orphaned,
+        dotenv_path=dotenv_path,
+        supabase_project=supabase_project,
+        supabase_checked=supabase_checked,
+        notes=list(notes or []),
+    )
+
+
 def _matrix_counts(matrix: SecretsMatrix) -> dict[str, int]:
     counts = {
         "required": 0,
@@ -2531,6 +2853,166 @@ def _matrix_output(matrix: SecretsMatrix, json_output: bool = False) -> None:
         _matrix_plain_output(matrix)
     else:
         _matrix_rich_output(matrix)
+
+
+def _ownership_counts(ownership: OwnershipMap) -> dict[str, int]:
+    counts = {
+        "keys": len(ownership.rows),
+        "orphaned": len(ownership.orphaned),
+        "mapped": 0,
+        "missing": 0,
+        "unverified": 0,
+        "provider_unverified": 0,
+        "runtime_built_in": 0,
+    }
+    for row in ownership.rows:
+        normalized = row.status.replace("-", "_")
+        counts[normalized] = counts.get(normalized, 0) + 1
+    return counts
+
+
+def _ownership_json_output(ownership: OwnershipMap) -> None:
+    output = {
+        "summary": {
+            "counts": _ownership_counts(ownership),
+            "values": "hidden",
+        },
+        "sources": {
+            "providers": ownership.providers,
+            "dotenv": str(ownership.dotenv_path) if ownership.dotenv_path else None,
+            "environment": "current process names only",
+            "supabase_project": ownership.supabase_project,
+            "supabase_checked": ownership.supabase_checked,
+        },
+        "notes": ownership.notes,
+        "rows": [
+            {
+                "key": row.key,
+                "owner": row.owner,
+                "should_live_in": row.should_live_in,
+                "observed_in": row.observed_in,
+                "requirement": row.requirement,
+                "status": row.status,
+                "references": row.references,
+            }
+            for row in ownership.rows
+        ],
+        "orphaned": [
+            {
+                "key": orphan.key,
+                "observed_in": orphan.observed_in,
+                "reason": orphan.reason,
+            }
+            for orphan in ownership.orphaned
+        ],
+    }
+    print(json.dumps(output, indent=2))
+
+
+def _ownership_plain_output(ownership: OwnershipMap) -> None:
+    counts = _ownership_counts(ownership)
+    print("envguard ownership — provider ownership map")
+    print("values: hidden; key names only")
+    providers = ", ".join(ownership.providers) if ownership.providers else "none detected"
+    print(f"providers: {providers}")
+    print(f"dotenv: {ownership.dotenv_path if ownership.dotenv_path else 'not found'}")
+    if ownership.supabase_project:
+        checked = "checked" if ownership.supabase_checked else "not checked"
+        print(f"supabase: {ownership.supabase_project} ({checked})")
+    print()
+    print("key\towner\tshould_live_in\tobserved_in\tstatus\trefs")
+    for row in ownership.rows:
+        print(
+            f"{row.key}\t{row.owner}\t{', '.join(row.should_live_in)}\t"
+            f"{', '.join(row.observed_in)}\t{row.status}\t{row.references}"
+        )
+    print()
+    print(
+        "summary: "
+        f"{counts['keys']} keys, {counts['mapped']} mapped, "
+        f"{counts['missing']} missing, {counts['unverified']} unverified, "
+        f"{counts['provider_unverified']} provider unverified, "
+        f"{counts['orphaned']} orphaned-looking"
+    )
+    if ownership.orphaned:
+        print("orphaned-looking keys:")
+        for orphan in ownership.orphaned:
+            print(f"  {orphan.key}\t{orphan.observed_in}\t{orphan.reason}")
+    for note in ownership.notes:
+        print(f"note: {note}")
+
+
+def _ownership_rich_output(ownership: OwnershipMap) -> None:
+    assert Console is not None
+    assert Table is not None
+    assert Panel is not None
+    console = Console()
+    counts = _ownership_counts(ownership)
+    summary = "[bold cyan]envguard ownership[/] — Provider Ownership Map\n"
+    summary += "  • Values are hidden; only key names and source names are shown"
+    summary += (
+        "\n  • providers: "
+        f"[green]{', '.join(ownership.providers)}[/]"
+        if ownership.providers
+        else "\n  • providers: [dim]none detected[/]"
+    )
+    if ownership.dotenv_path:
+        summary += f"\n  • dotenv: [green]{ownership.dotenv_path}[/]"
+    if ownership.supabase_project:
+        checked = "checked" if ownership.supabase_checked else "not checked"
+        summary += f"\n  • Supabase project: [green]{ownership.supabase_project}[/] ({checked})"
+    console.print()
+    console.print(Panel(summary, border_style="cyan"))
+    console.print()
+
+    table = Table(title="Provider ownership", border_style="cyan")
+    table.add_column("Key", no_wrap=True)
+    table.add_column("Owner")
+    table.add_column("Should live in")
+    table.add_column("Observed in")
+    table.add_column("Status")
+    table.add_column("Refs", justify="right")
+    for row in ownership.rows:
+        status_style = "green" if row.status in {"mapped", "runtime-built-in"} else "yellow"
+        if row.status == "missing":
+            status_style = "red"
+        table.add_row(
+            row.key,
+            row.owner,
+            ", ".join(row.should_live_in),
+            ", ".join(row.observed_in),
+            f"[{status_style}]{row.status}[/]",
+            str(row.references),
+        )
+    console.print(table)
+    console.print()
+    console.print(
+        "[bold]Summary:[/] "
+        f"{counts['keys']} keys, {counts['mapped']} mapped, "
+        f"{counts['missing']} missing, {counts['unverified']} unverified, "
+        f"{counts['provider_unverified']} provider unverified, "
+        f"{counts['orphaned']} orphaned-looking"
+    )
+    if ownership.orphaned:
+        orphan_table = Table(title="Orphaned-looking keys", border_style="magenta")
+        orphan_table.add_column("Key", no_wrap=True)
+        orphan_table.add_column("Observed in")
+        orphan_table.add_column("Reason")
+        for orphan in ownership.orphaned:
+            orphan_table.add_row(orphan.key, orphan.observed_in, orphan.reason)
+        console.print(orphan_table)
+    for note in ownership.notes:
+        console.print(f"[dim]Note:[/] {note}")
+    console.print()
+
+
+def _ownership_output(ownership: OwnershipMap, json_output: bool = False) -> None:
+    if json_output:
+        _ownership_json_output(ownership)
+    elif Console is None:
+        _ownership_plain_output(ownership)
+    else:
+        _ownership_rich_output(ownership)
 
 
 # ─── Remediation plan output ─────────────────────────────────────────────────
@@ -3771,6 +4253,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard wizard                   Build the right command interactively\n"
             "  envguard apps/web                  Scan a specific project\n"
             "  envguard doctor                    Show secret readiness matrix\n"
+            "  envguard ownership                 Show provider ownership map\n"
             "  envguard plan                      Print dry remediation proposals\n"
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard ci-template               Print a GitHub Actions workflow\n"
@@ -3792,7 +4275,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help=(
             "Optional project path or preset: wizard, ci, ci-template, "
-            "doctor, matrix, plan, supabase <project-ref>, init, update"
+            "doctor, matrix, ownership, owners, plan, supabase <project-ref>, init, update"
         ),
     )
     parser.add_argument(
@@ -3965,6 +4448,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                 parser.error(f"{first} accepts at most one project path")
             if len(tokens) == 2:
                 args.path = tokens[1]
+        elif first in {"ownership", "owners"}:
+            args.command = "ownership"
+            if len(tokens) > 2:
+                parser.error(f"{first} accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
         elif first == "plan":
             args.command = "plan"
             if len(tokens) > 2:
@@ -4130,7 +4619,7 @@ def main(argv: Optional[List[str]] = None):
                     f"{supabase_project}"
                 )
             supabase_keys = fetch_supabase_secrets_with_cli(supabase_project, scan_path)
-        elif explicit_supabase_project and args.command not in {"doctor", "plan"}:
+        elif explicit_supabase_project and args.command not in {"doctor", "plan", "ownership"}:
             print(
                 "Error: SUPABASE_ACCESS_TOKEN environment variable or an authenticated "
                 "Supabase CLI is required when using --supabase-project. You can also "
@@ -4177,6 +4666,23 @@ def main(argv: Optional[List[str]] = None):
         _matrix_output(matrix, json_output=args.json)
         if secrets_matrix_has_required_missing(matrix) and not args.allow_missing:
             sys.exit(1)
+        return
+
+    if args.command == "ownership":
+        ownership = build_ownership_map(
+            ref_map,
+            dotenv_keys,
+            os.environ,
+            supabase_keys,
+            optional_keys=config.optional + args.optional,
+            external_keys=config.external + args.external,
+            ignore_keys=config.ignore_missing + args.ignore_missing,
+            dotenv_path=dotenv_path if dotenv_path.exists() else None,
+            supabase_project=supabase_project,
+            scan_path=scan_path,
+            notes=doctor_notes,
+        )
+        _ownership_output(ownership, json_output=args.json)
         return
 
     # ── Analyze ────────────────────────────────────────────────────────────
