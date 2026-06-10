@@ -46,9 +46,101 @@ except ImportError:
 
 APP_NAME = "envguard"
 DIST_NAME = "envguard"
+__version__ = "1.0.0"
+JSON_SCHEMA_VERSION = 1
 REPO_URL = "https://github.com/Tresnanda/envguard.git"
 REPO_SPEC = f"git+{REPO_URL}"
 MIN_PYTHON = (3, 9)
+
+DEFAULT_BUILTIN_PROFILES = ("github-actions", "shell", "ci")
+RUNTIME_BUILTIN_PROFILES: dict[str, tuple[str, ...]] = {
+    # GitHub-hosted runner variables are provided by Actions at runtime. Keep
+    # GITHUB_TOKEN out: it is a secret-like token users should wire explicitly.
+    "github-actions": (
+        "ACTIONS_CACHE_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_RUNTIME_URL",
+        "ACTIONS_STEP_DEBUG",
+        "GITHUB_ACTION",
+        "GITHUB_ACTION_PATH",
+        "GITHUB_ACTION_REPOSITORY",
+        "GITHUB_ACTIONS",
+        "GITHUB_ACTOR",
+        "GITHUB_ACTOR_ID",
+        "GITHUB_API_URL",
+        "GITHUB_BASE_REF",
+        "GITHUB_ENV",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "GITHUB_GRAPHQL_URL",
+        "GITHUB_HEAD_REF",
+        "GITHUB_JOB",
+        "GITHUB_OUTPUT",
+        "GITHUB_PATH",
+        "GITHUB_REF",
+        "GITHUB_REF_NAME",
+        "GITHUB_REF_PROTECTED",
+        "GITHUB_REF_TYPE",
+        "GITHUB_REPOSITORY",
+        "GITHUB_REPOSITORY_ID",
+        "GITHUB_REPOSITORY_OWNER",
+        "GITHUB_REPOSITORY_OWNER_ID",
+        "GITHUB_RETENTION_DAYS",
+        "GITHUB_RUN_ATTEMPT",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_NUMBER",
+        "GITHUB_SERVER_URL",
+        "GITHUB_SHA",
+        "GITHUB_STEP_SUMMARY",
+        "GITHUB_TRIGGERING_ACTOR",
+        "GITHUB_WORKFLOW",
+        "GITHUB_WORKFLOW_REF",
+        "GITHUB_WORKFLOW_SHA",
+        "GITHUB_WORKSPACE",
+        "RUNNER_*",
+    ),
+    "shell": (
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "OLDPWD",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "SHLVL",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "XDG_*",
+    ),
+    "ci": (
+        "CI",
+    ),
+}
+
+
+def tool_version() -> str:
+    """Return the installed envguard version for machine-readable output."""
+    try:
+        return importlib.metadata.version(DIST_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return __version__
+
+
+def _json_schema_metadata(mode: str) -> dict[str, object]:
+    """Return stable top-level metadata for JSON consumers."""
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "tool_version": tool_version(),
+        "scan": {
+            "kind": "envguard.scan",
+            "mode": mode,
+        },
+    }
 
 
 # ─── Data Structures ───────────────────────────────────────────────────────
@@ -64,6 +156,17 @@ class EnvReference:
     pattern_type: str  # e.g. "os.getenv", "process.env", "$VAR"
     requirement: str = "required"  # required, optional, or external
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class EnvKeyTypoSuggestion:
+    """Advisory-only hint for two similarly named environment keys."""
+
+    key: str
+    key_sources: List[str]
+    similar_key: str
+    similar_key_sources: List[str]
+    distance: int
 
 
 @dataclass
@@ -90,6 +193,9 @@ class ScanResult:
 
     supabase_orphans: List[str] = field(default_factory=list)
     """Keys in Supabase secrets but not referenced in code nor .env.example."""
+
+    key_typos: List[EnvKeyTypoSuggestion] = field(default_factory=list)
+    """Advisory-only likely typo/sibling pairs among discovered key names."""
 
 
 @dataclass
@@ -154,6 +260,39 @@ class OwnershipMap:
 
 
 @dataclass
+class RemediationProposal:
+    """One dry, copy-pasteable remediation suggestion."""
+
+    kind: str
+    label: str
+    command: Optional[str] = None
+    note: str = ""
+
+
+@dataclass
+class RemediationAction:
+    """Proposal-only next steps for one finding key."""
+
+    key: str
+    finding: str
+    status: str
+    requirement: str
+    proposals: List[RemediationProposal]
+
+
+@dataclass
+class RemediationPlan:
+    """A non-mutating remediation plan derived from the doctor matrix."""
+
+    actions: List[RemediationAction]
+    counts: dict[str, int]
+    dotenv_path: Optional[Path] = None
+    supabase_project: Optional[str] = None
+    supabase_checked: bool = False
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass
 class EnvguardConfig:
     """Configuration loaded from [tool.envguard] in pyproject.toml."""
 
@@ -165,6 +304,7 @@ class EnvguardConfig:
     optional: List[str] = field(default_factory=list)
     external: List[str] = field(default_factory=list)
     ignore_missing: List[str] = field(default_factory=list)
+    builtin_profiles: List[str] = field(default_factory=lambda: list(DEFAULT_BUILTIN_PROFILES))
 
 
 @dataclass
@@ -240,6 +380,16 @@ PATTERNS: List[Tuple[re.Pattern, str, frozenset[str]]] = [
     (
         re.compile(r'Deno\.env\.get\s*\(\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
         "Deno.env.get",
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'Bun\.env\.([A-Za-z_][A-Za-z0-9_]*)'),
+        "Bun.env.KEY",
+        frozenset({"js"}),
+    ),
+    (
+        re.compile(r'Bun\.env\s*\[\s*["\']([A-Za-z_][A-Za-z0-9_]*)["\']'),
+        'Bun.env["KEY"]',
         frozenset({"js"}),
     ),
     # Ruby
@@ -513,7 +663,7 @@ def _classify_reference(
     absolute_offset: int,
 ) -> tuple[str, str]:
     """Classify whether a reference is required, optional, or external."""
-    if pattern_type.startswith("process.env") and _is_offset_in_raw_js_template(
+    if pattern_type.startswith(("process.env", "Bun.env")) and _is_offset_in_raw_js_template(
         full_text,
         absolute_offset,
     ):
@@ -534,6 +684,9 @@ def _classify_reference(
     if pattern_type in {
         "process.env.KEY",
         'process.env["KEY"]',
+        "process.env destructuring",
+        "Bun.env.KEY",
+        'Bun.env["KEY"]',
         "Deno.env.get",
         "os.getenv",
         "os.environ.get",
@@ -637,6 +790,71 @@ def _detect_sveltekit_refs(
                 file_path,
                 _line_for_offset(text, match.start()),
                 "$env/dynamic.KEY",
+            )
+
+
+def _detect_process_env_destructuring_refs(
+    file_path: Path,
+    text: str,
+    refs: List[EnvReference],
+    seen: set[tuple[str, int, str]],
+) -> None:
+    """Detect JavaScript destructuring reads from process.env."""
+    if "process.env" not in text:
+        return
+
+    destructure_pattern = re.compile(
+        r'(?:\b(?:const|let|var)\s+)?\{(?P<body>[^{}]*)\}\s*=\s*process\.env\b',
+        re.DOTALL,
+    )
+    key_pattern = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\b\s*(?::|=|$)')
+    for match in destructure_pattern.finditer(text):
+        body = match.group("body")
+        body_start = match.start("body")
+        for item_match in re.finditer(r"[^,]+", body):
+            raw_item = item_match.group(0)
+            leading_whitespace = len(raw_item) - len(raw_item.lstrip())
+            item = raw_item.strip()
+            if not item or item.startswith("..."):
+                continue
+            key_match = key_pattern.match(item)
+            if not key_match:
+                continue
+
+            absolute_offset = body_start + item_match.start() + leading_whitespace
+            key = key_match.group(1)
+            line = _line_for_offset(text, absolute_offset)
+            line_start = text.rfind("\n", 0, absolute_offset) + 1
+            line_end = text.find("\n", absolute_offset)
+            if line_end == -1:
+                line_end = len(text)
+            line_text = text[line_start:line_end]
+            match_start = absolute_offset - line_start
+            has_default = re.match(
+                rf'{re.escape(key)}\s*(?:=|:\s*[A-Za-z_$][A-Za-z0-9_$]*\s*=)',
+                item,
+            )
+            if has_default:
+                requirement, reason = "optional", "inline default or guard"
+            else:
+                requirement, reason = _classify_reference(
+                    "process.env destructuring",
+                    line_text,
+                    match_start,
+                    match_start + len(key),
+                    key,
+                    text,
+                    absolute_offset,
+                )
+            _add_ref(
+                refs,
+                seen,
+                key,
+                file_path,
+                line,
+                "process.env destructuring",
+                requirement,
+                reason,
             )
 
 
@@ -780,6 +998,7 @@ def detect_references(file_path: Path) -> List[EnvReference]:
                 )
 
     if "js" in scopes:
+        _detect_process_env_destructuring_refs(file_path, text, refs, seen)
         _detect_sveltekit_refs(file_path, text, refs, seen)
         _detect_zod_process_env_schema_refs(file_path, text, refs, seen)
     if "python" in scopes:
@@ -984,6 +1203,43 @@ def _looks_generated_or_minified(path: Path) -> bool:
     return average_line_length > 500 or very_long_lines >= 3
 
 
+def normalize_builtin_profiles(profiles: Optional[List[str]]) -> List[str]:
+    """Return known built-in profile names in stable order without duplicates."""
+    if profiles is None:
+        profiles = list(DEFAULT_BUILTIN_PROFILES)
+
+    normalized: List[str] = []
+    for profile in profiles:
+        name = profile.strip().lower()
+        if name in RUNTIME_BUILTIN_PROFILES and name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
+def _matches_runtime_builtin(key: str, profile: str) -> bool:
+    """Return whether a key matches one built-in runtime profile pattern."""
+    return any(fnmatch(key, pattern) for pattern in RUNTIME_BUILTIN_PROFILES[profile])
+
+
+def runtime_builtin_profile_for_key(
+    key: str,
+    profiles: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Return the built-in runtime profile that owns a key, if any."""
+    for profile in normalize_builtin_profiles(profiles):
+        if _matches_runtime_builtin(key, profile):
+            return profile
+    return None
+
+
+def runtime_builtin_external_keys(
+    keys: set[str],
+    profiles: Optional[List[str]] = None,
+) -> List[str]:
+    """Return referenced keys supplied by selected built-in runtime profiles."""
+    return sorted(key for key in keys if runtime_builtin_profile_for_key(key, profiles))
+
+
 # ─── Project configuration ─────────────────────────────────────────────────
 
 
@@ -1011,6 +1267,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
     optional = raw_config.get("optional", [])
     external = raw_config.get("external", [])
     ignore_missing = raw_config.get("ignore_missing", [])
+    builtin_profiles = raw_config.get("builtin_profiles", list(DEFAULT_BUILTIN_PROFILES))
 
     def list_of_strings(value: object) -> List[str]:
         return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
@@ -1024,6 +1281,7 @@ def load_project_config(scan_path: Path) -> EnvguardConfig:
         optional=list_of_strings(optional),
         external=list_of_strings(external),
         ignore_missing=list_of_strings(ignore_missing),
+        builtin_profiles=normalize_builtin_profiles(list_of_strings(builtin_profiles)),
     )
 
 
@@ -1064,17 +1322,27 @@ def write_project_config(
     pyproject_path = project_path / "pyproject.toml"
     new_block = _format_project_config(dotenv, exclude, supabase_project)
 
-    if not pyproject_path.exists():
-        pyproject_path.write_text(new_block, encoding="utf-8")
-        return pyproject_path
+    if pyproject_path.is_symlink():
+        raise OSError(f"Refusing to update symlinked pyproject.toml: {pyproject_path}")
 
-    existing = pyproject_path.read_text(encoding="utf-8")
+    try:
+        existing, file_mode = _read_text_no_follow(pyproject_path)
+    except FileNotFoundError:
+        _atomic_write_no_follow(pyproject_path, new_block, 0o644)
+        return pyproject_path
+    except OSError as exc:
+        if "O_NOFOLLOW is unavailable" in str(exc):
+            raise OSError(
+                f"Refusing to update pyproject.toml without no-follow protection: {pyproject_path}"
+            ) from exc
+        raise OSError(f"Refusing to update non-regular pyproject.toml: {pyproject_path}") from exc
+
     pattern = re.compile(r"(?ms)^\[tool\.envguard\]\n.*?(?=^\[|\Z)")
     if pattern.search(existing):
         updated = pattern.sub(new_block, existing).rstrip() + "\n"
     else:
         updated = existing.rstrip() + "\n\n" + new_block
-    pyproject_path.write_text(updated, encoding="utf-8")
+    _atomic_write_no_follow(pyproject_path, updated, file_mode)
     return pyproject_path
 
 
@@ -1124,6 +1392,48 @@ def _display_path(path: Path, base: Optional[Path] = None) -> str:
         except ValueError:
             pass
     return path.as_posix()
+
+
+def _repo_root_for_path(path: Path) -> Path:
+    """Return the repository root for path, falling back to the scan root."""
+    start = path if path.is_dir() else path.parent
+    git = shutil.which("git")
+    if git:
+        try:
+            result = subprocess.run(
+                [git, "-C", str(start), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result and result.returncode == 0:
+            root = result.stdout.strip()
+            if root:
+                return Path(root).resolve()
+
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+
+    return start.resolve()
+
+
+def _reference_output_path(file_path: str, reference_root: Optional[Path] = None) -> str:
+    """Return a repo-relative reference path when file_path is inside root."""
+    path = Path(file_path)
+    if reference_root is None or not path.is_absolute():
+        return path.as_posix()
+
+    root = reference_root.resolve()
+    resolved_path = path.resolve(strict=False)
+    try:
+        relative = resolved_path.relative_to(root)
+    except ValueError:
+        return path.as_posix()
+    return relative.as_posix() or "."
 
 
 def _is_safe_ci_dotenv(path: Path) -> bool:
@@ -1831,6 +2141,94 @@ def delete_supabase_secrets(project_ref: str, access_token: str, names: List[str
 # ─── Analysis ──────────────────────────────────────────────────────────────
 
 
+KEY_TYPO_SOURCE_ORDER = ("referenced", "dotenv", "supabase")
+KEY_TYPO_MIN_LENGTH = 6
+KEY_TYPO_MAX_DISTANCE = 1
+
+
+def _ordered_key_sources(sources: set[str]) -> List[str]:
+    return [source for source in KEY_TYPO_SOURCE_ORDER if source in sources]
+
+
+def _env_key_edit_distance(left: str, right: str, max_distance: int) -> int:
+    """Return a small Damerau-Levenshtein distance, capped above max_distance."""
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+
+    previous_previous: Optional[List[int]] = None
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i] + [0] * len(right)
+        row_min = current[0]
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current[j] = min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + cost,
+            )
+            if (
+                previous_previous is not None
+                and i > 1
+                and j > 1
+                and left_char == right[j - 2]
+                and left[i - 2] == right_char
+            ):
+                current[j] = min(current[j], previous_previous[j - 2] + 1)
+            row_min = min(row_min, current[j])
+        if row_min > max_distance:
+            return max_distance + 1
+        previous_previous, previous = previous, current
+    return previous[-1]
+
+
+def _looks_like_typo_candidate(key: str) -> bool:
+    """Keep typo hints focused on human-named env keys, not short flags like CI."""
+    return len(key) >= KEY_TYPO_MIN_LENGTH and "_" in key
+
+
+def detect_key_typo_suggestions(
+    referenced_keys: List[str],
+    dotenv_keys: List[str],
+    supabase_keys: Optional[List[str]] = None,
+) -> List[EnvKeyTypoSuggestion]:
+    """Find advisory-only likely env key typos without inspecting secret values."""
+    sources_by_key: dict[str, set[str]] = {}
+    for source, keys in (
+        ("referenced", referenced_keys),
+        ("dotenv", dotenv_keys),
+        ("supabase", supabase_keys or []),
+    ):
+        for key in keys:
+            if _looks_like_typo_candidate(key):
+                sources_by_key.setdefault(key, set()).add(source)
+
+    suggestions: List[EnvKeyTypoSuggestion] = []
+    keys = sorted(sources_by_key)
+    for index, key in enumerate(keys):
+        for similar_key in keys[index + 1 :]:
+            if sources_by_key[key] == sources_by_key[similar_key]:
+                continue
+            distance = _env_key_edit_distance(
+                key.upper(),
+                similar_key.upper(),
+                KEY_TYPO_MAX_DISTANCE,
+            )
+            if 0 < distance <= KEY_TYPO_MAX_DISTANCE:
+                suggestions.append(
+                    EnvKeyTypoSuggestion(
+                        key=key,
+                        key_sources=_ordered_key_sources(sources_by_key[key]),
+                        similar_key=similar_key,
+                        similar_key_sources=_ordered_key_sources(sources_by_key[similar_key]),
+                        distance=distance,
+                    )
+                )
+    return suggestions
+
+
 def analyze(
     ref_map: Dict[str, List[EnvReference]],
     dotenv_keys: List[str],
@@ -1838,6 +2236,7 @@ def analyze(
     optional_keys: Optional[List[str]] = None,
     external_keys: Optional[List[str]] = None,
     ignore_keys: Optional[List[str]] = None,
+    builtin_profiles: Optional[List[str]] = None,
 ) -> ScanResult:
     """Cross-reference code references against expected keys."""
     result = ScanResult(references=ref_map)
@@ -1852,7 +2251,9 @@ def analyze(
 
     required_key_set: set[str] = set()
     optional_key_set: set[str] = set(optional_keys or [])
-    external_key_set: set[str] = set(external_keys or [])
+    external_key_set: set[str] = set(external_keys or []) | set(
+        runtime_builtin_external_keys(code_keys, builtin_profiles)
+    )
     ignored_key_set: set[str] = set(ignore_keys or [])
     for key, refs in ref_map.items():
         if key in ignored_key_set:
@@ -1881,6 +2282,12 @@ def analyze(
     if supabase_keys is not None:
         code_and_example = code_keys | example_keys
         result.supabase_orphans = sorted(supabase_set - code_and_example)
+
+    result.key_typos = detect_key_typo_suggestions(
+        sorted(code_keys),
+        dotenv_keys,
+        supabase_keys,
+    )
 
     return result
 
@@ -1927,6 +2334,7 @@ def build_secrets_matrix(
     optional_keys: Optional[List[str]] = None,
     external_keys: Optional[List[str]] = None,
     ignore_keys: Optional[List[str]] = None,
+    builtin_profiles: Optional[List[str]] = None,
     dotenv_path: Optional[Path] = None,
     supabase_project: Optional[str] = None,
     notes: Optional[List[str]] = None,
@@ -1937,7 +2345,9 @@ def build_secrets_matrix(
     supabase_set = set(supabase_keys or [])
     supabase_checked = supabase_keys is not None
     optional_set = set(optional_keys or [])
-    external_set = set(external_keys or [])
+    external_set = set(external_keys or []) | set(
+        runtime_builtin_external_keys(set(ref_map), builtin_profiles)
+    )
     ignored_set = set(ignore_keys or [])
 
     rows: List[SecretsMatrixRow] = []
@@ -2303,6 +2713,7 @@ def _availability_marker(value: Optional[bool]) -> str:
 
 def _matrix_json_output(matrix: SecretsMatrix) -> None:
     output = {
+        **_json_schema_metadata("secrets-matrix"),
         "summary": {
             "counts": _matrix_counts(matrix),
             "blocking": secrets_matrix_has_required_missing(matrix),
@@ -2604,6 +3015,256 @@ def _ownership_output(ownership: OwnershipMap, json_output: bool = False) -> Non
         _ownership_rich_output(ownership)
 
 
+# ─── Remediation plan output ─────────────────────────────────────────────────
+
+PLAN_PLACEHOLDER = "replace-me"
+
+
+def _dotenv_plan_path(dotenv_path: Optional[Path], scan_path: Path) -> str:
+    target = dotenv_path or (scan_path if scan_path.is_dir() else scan_path.parent) / ".env.example"
+    base = scan_path if scan_path.is_dir() else scan_path.parent
+    return _display_path(target, base)
+
+
+def _scan_plan_path(scan_path: Path) -> str:
+    return _display_path(scan_path, Path.cwd())
+
+
+def _dotenv_append_command(key: str, dotenv_path: Optional[Path], scan_path: Path) -> str:
+    dotenv_display = shlex.quote(_dotenv_plan_path(dotenv_path, scan_path))
+    key_assignment = shlex.quote(f"{key}=")
+    return f"printf '%s\\n' {key_assignment} >> {dotenv_display}"
+
+
+def _supabase_set_command(key: str, project_ref: Optional[str]) -> str:
+    ref = project_ref or "YOUR_PROJECT_REF"
+    key_arg = shlex.quote(key)
+    return f"supabase secrets set {key_arg}='{PLAN_PLACEHOLDER}' --project-ref {shlex.quote(ref)}"
+
+
+def _envguard_override_command(flag: str, key: str, scan_path: Path) -> str:
+    args = ["envguard", flag, key]
+    path_arg = _scan_plan_path(scan_path)
+    if path_arg != ".":
+        args.append(path_arg)
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def _supabase_unset_command(key: str, project_ref: Optional[str]) -> str:
+    ref = project_ref or "YOUR_PROJECT_REF"
+    return f"supabase secrets unset {shlex.quote(key)} --project-ref {shlex.quote(ref)}"
+
+
+def _plan_proposals_for_row(
+    row: SecretsMatrixRow,
+    scan_path: Path,
+    dotenv_path: Optional[Path],
+    supabase_project: Optional[str],
+) -> List[RemediationProposal]:
+    proposals = [
+        RemediationProposal(
+            kind="add_dotenv_example",
+            label="Document the key in the dotenv contract",
+            command=_dotenv_append_command(row.key, dotenv_path, scan_path),
+            note="Adds an empty placeholder only; choose and store the real value separately.",
+        )
+    ]
+    if row.status == "missing":
+        proposals.extend(
+            [
+                RemediationProposal(
+                    kind="set_supabase_secret",
+                    label="Set a Supabase Edge Function secret placeholder",
+                    command=_supabase_set_command(row.key, supabase_project),
+                    note=(
+                        "Replace the placeholder before running; envguard never "
+                        "prints secret values."
+                    ),
+                ),
+                RemediationProposal(
+                    kind="mark_optional",
+                    label="If the key is defaulted, mark it optional for envguard",
+                    command=_envguard_override_command("--optional", row.key, scan_path),
+                ),
+                RemediationProposal(
+                    kind="mark_external",
+                    label="If another runtime owns the key, mark it external for envguard",
+                    command=_envguard_override_command("--external", row.key, scan_path),
+                ),
+            ]
+        )
+    elif row.status == "optional-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="mark_optional",
+                label="Persist the optional classification in envguard config or CLI usage",
+                command=_envguard_override_command("--optional", row.key, scan_path),
+            )
+        )
+    elif row.status == "external-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="mark_external",
+                label="Persist the external/runtime classification in envguard config or CLI usage",
+                command=_envguard_override_command("--external", row.key, scan_path),
+            )
+        )
+    elif row.status == "ignored-missing":
+        proposals.append(
+            RemediationProposal(
+                kind="review_ignore",
+                label="Review the ignore-missing override and keep it only if intentional",
+                note=(
+                    "Ignored missing keys are advisory because envguard config "
+                    "already suppresses them."
+                ),
+            )
+        )
+    return proposals
+
+
+def build_remediation_plan(matrix: SecretsMatrix, scan_path: Path) -> RemediationPlan:
+    """Build dry remediation proposals from doctor findings without reading values."""
+    actions: List[RemediationAction] = []
+    for row in matrix.rows:
+        if row.status == "ready":
+            continue
+        actions.append(
+            RemediationAction(
+                key=row.key,
+                finding=row.status.replace("-", "_"),
+                status=row.status,
+                requirement=row.requirement,
+                proposals=_plan_proposals_for_row(
+                    row,
+                    scan_path,
+                    matrix.dotenv_path,
+                    matrix.supabase_project,
+                ),
+            )
+        )
+
+    for key in matrix.supabase_orphans:
+        actions.append(
+            RemediationAction(
+                key=key,
+                finding="supabase_orphan",
+                status="orphaned",
+                requirement="review",
+                proposals=[
+                    RemediationProposal(
+                        kind="review_orphan",
+                        label="Review whether this remote Supabase secret is still needed",
+                        command=_supabase_unset_command(key, matrix.supabase_project),
+                        note="Run the command only after confirming the secret is stale.",
+                    )
+                ],
+            )
+        )
+
+    counts = _matrix_counts(matrix)
+    return RemediationPlan(
+        actions=actions,
+        counts={
+            "missing": counts["missing"],
+            "optional_missing": counts["optional_missing"],
+            "external_missing": counts["external_missing"],
+            "ignored_missing": counts["ignored_missing"],
+            "supabase_orphans": counts["supabase_orphans"],
+        },
+        dotenv_path=matrix.dotenv_path,
+        supabase_project=matrix.supabase_project,
+        supabase_checked=matrix.supabase_checked,
+        notes=matrix.notes,
+    )
+
+
+def _plan_json_output(plan: RemediationPlan) -> None:
+    output = {
+        "summary": {
+            "counts": plan.counts,
+            "writes": False,
+            "exit_code": 0,
+        },
+        "sources": {
+            "dotenv": str(plan.dotenv_path) if plan.dotenv_path else None,
+            "supabase_project": plan.supabase_project,
+            "supabase_checked": plan.supabase_checked,
+        },
+        "notes": [
+            "Proposal-only remediation plan: no prompts, backups, dotenv writes, "
+            "or secret writes were run.",
+            *plan.notes,
+        ],
+        "actions": [
+            {
+                "key": action.key,
+                "finding": action.finding,
+                "status": action.status,
+                "requirement": action.requirement,
+                "proposals": [
+                    {
+                        "kind": proposal.kind,
+                        "label": proposal.label,
+                        **({"command": proposal.command} if proposal.command else {}),
+                        **({"note": proposal.note} if proposal.note else {}),
+                    }
+                    for proposal in action.proposals
+                ],
+            }
+            for action in actions_sorted(plan.actions)
+        ],
+    }
+    print(json.dumps(output, indent=2))
+
+
+def actions_sorted(actions: List[RemediationAction]) -> List[RemediationAction]:
+    return sorted(actions, key=lambda action: (action.finding, action.key))
+
+
+def _plan_plain_output(plan: RemediationPlan) -> None:
+    print("envguard plan — remediation proposals (dry run)")
+    print(
+        "Values are hidden. No files were written, no backups were created, "
+        "and no secrets were changed."
+    )
+    if plan.dotenv_path:
+        print(f"dotenv: {plan.dotenv_path}")
+    if plan.supabase_project:
+        print(f"supabase: {plan.supabase_project}")
+    print()
+
+    if not plan.actions:
+        print("No missing or orphaned secret findings need remediation.")
+    for action in actions_sorted(plan.actions):
+        print(f"{action.finding}: {action.key}")
+        for proposal in action.proposals:
+            print(f"  - {proposal.label}")
+            if proposal.command:
+                print(f"    {proposal.command}")
+            if proposal.note:
+                print(f"    note: {proposal.note}")
+        print()
+
+    print(
+        "summary: "
+        f"{plan.counts['missing']} missing, "
+        f"{plan.counts['optional_missing']} optional missing, "
+        f"{plan.counts['external_missing']} external missing, "
+        f"{plan.counts['ignored_missing']} ignored missing, "
+        f"{plan.counts['supabase_orphans']} orphaned Supabase secrets"
+    )
+    for note in plan.notes:
+        print(f"note: {note}")
+
+
+def _plan_output(plan: RemediationPlan, json_output: bool = False) -> None:
+    if json_output:
+        _plan_json_output(plan)
+    else:
+        _plan_plain_output(plan)
+
+
 BASELINE_VERSION = 1
 FINDING_FIELDS = (
     "unused",
@@ -2693,6 +3354,9 @@ def _rich_output(
     baseline_suppressed: Optional[dict[str, int]] = None,
 ):
     """Pretty terminal output using rich."""
+    assert Console is not None
+    assert Table is not None
+    assert Panel is not None
     console = Console()
     should_show_details_command = False
 
@@ -2820,6 +3484,34 @@ def _rich_output(
             should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
 
+    # Env key typo/sibling advisories (non-blocking)
+    if result.key_typos:
+        if show_details:
+            table = Table(
+                title="[blue]ADVISORY[/] — Similar environment key names",
+                border_style="blue",
+            )
+            table.add_column("Key", style="blue", no_wrap=True)
+            table.add_column("Sources", style="dim")
+            table.add_column("Similar key", style="blue", no_wrap=True)
+            table.add_column("Similar sources", style="dim")
+            for suggestion in result.key_typos:
+                table.add_row(
+                    suggestion.key,
+                    ", ".join(suggestion.key_sources),
+                    suggestion.similar_key,
+                    ", ".join(suggestion.similar_key_sources),
+                )
+            console.print(table)
+        else:
+            label = "pair" if len(result.key_typos) == 1 else "pairs"
+            console.print(
+                f"[blue]i[/] {len(result.key_typos)} similar env key {label} found "
+                "(possible typo)."
+            )
+            should_show_details_command = should_show_details_command or bool(details_command)
+        console.print()
+
     # Supabase orphans
     if result.supabase_orphans:
         if show_details:
@@ -2846,7 +3538,7 @@ def _rich_output(
 
     # Overall status
     blocking_issues = bool(result.unused or result.missing or result.supabase_orphans)
-    advisory_issues = bool(result.optional_missing or result.external_missing)
+    advisory_issues = bool(result.optional_missing or result.external_missing or result.key_typos)
     if blocking_issues:
         if show_details:
             console.print("[bold red]✗[/] Issues found. Review the tables above.")
@@ -2903,9 +3595,11 @@ def _json_output(
     allow_missing: bool = False,
     baseline_path: Optional[Path] = None,
     baseline_suppressed: Optional[dict[str, int]] = None,
+    reference_root: Optional[Path] = None,
 ) -> None:
     """JSON machine-readable output."""
     output = {
+        **_json_schema_metadata("env-audit"),
         "summary": _json_summary(
             result,
             allow_unused=allow_unused,
@@ -2919,10 +3613,20 @@ def _json_output(
         "external_missing": result.external_missing,
         "ignored_missing": result.ignored_missing,
         "supabase_orphans": result.supabase_orphans,
+        "key_typos": [
+            {
+                "key": suggestion.key,
+                "sources": suggestion.key_sources,
+                "similar_key": suggestion.similar_key,
+                "similar_sources": suggestion.similar_key_sources,
+                "distance": suggestion.distance,
+            }
+            for suggestion in result.key_typos
+        ],
         "references": {
             key: [
                 {
-                    "file": r.file,
+                    "file": _reference_output_path(r.file, reference_root),
                     "line": r.line,
                     "pattern": r.pattern_type,
                     "requirement": r.requirement,
@@ -2960,6 +3664,7 @@ def format_summary_line(
         (len(result.optional_missing), "optional"),
         (len(result.external_missing), "external"),
         (len(result.ignored_missing), "ignored"),
+        (len(result.key_typos), "typo"),
         (len(result.supabase_orphans), "orphaned"),
     ]
     actual_counts_present = any(count for count, _label in counts)
@@ -3001,7 +3706,21 @@ def _escape_annotation_message(value: str) -> str:
     )
 
 
-def build_github_annotations(result: ScanResult) -> List[str]:
+def _escape_annotation_property(value: str) -> str:
+    """Escape a GitHub Actions annotation property value."""
+    return (
+        value.replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+        .replace(":", "%3A")
+        .replace(",", "%2C")
+    )
+
+
+def build_github_annotations(
+    result: ScanResult,
+    reference_root: Optional[Path] = None,
+) -> List[str]:
     """Build GitHub Actions annotations for missing, unused, and orphaned keys."""
     annotations: List[str] = []
 
@@ -3009,9 +3728,12 @@ def build_github_annotations(result: ScanResult) -> List[str]:
         refs = result.references.get(key, [])
         if refs:
             for ref in refs:
+                file_path = _escape_annotation_property(
+                    _reference_output_path(ref.file, reference_root)
+                )
                 annotations.append(
                     (
-                        f"::error file={ref.file},line={ref.line}::"
+                        f"::error file={file_path},line={ref.line}::"
                         f"Missing environment variable {_escape_annotation_message(key)}"
                     )
                 )
@@ -3045,9 +3767,12 @@ def build_github_annotations(result: ScanResult) -> List[str]:
     return annotations
 
 
-def _github_annotations_output(result: ScanResult) -> None:
+def _github_annotations_output(
+    result: ScanResult,
+    reference_root: Optional[Path] = None,
+) -> None:
     """Print GitHub Actions annotations."""
-    for annotation in build_github_annotations(result):
+    for annotation in build_github_annotations(result, reference_root=reference_root):
         print(annotation)
 
 
@@ -3120,8 +3845,15 @@ def _write_backup_exclusive(path: Path, content: str) -> Path:
 
 
 def _no_follow_flags(flags: int) -> int:
-    """Add O_NOFOLLOW when the platform exposes it."""
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    """Add O_NOFOLLOW, failing closed when unavailable.
+
+    The callers use this for user-controlled config/dotenv write paths. Falling
+    back to plain open() would silently follow a swapped final-component symlink,
+    so platforms without O_NOFOLLOW must refuse the hardened operation instead.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("Refusing no-follow file operation: O_NOFOLLOW is unavailable")
     return flags | no_follow
 
 
@@ -3131,7 +3863,7 @@ def _read_text_no_follow(path: Path) -> tuple[str, int]:
     try:
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError(f"Refusing to read non-regular dotenv file: {path}")
+            raise OSError(f"Refusing to read non-regular file: {path}")
         mode = stat.S_IMODE(file_stat.st_mode)
         with os.fdopen(fd, "r", encoding="utf-8") as file_obj:
             fd = -1
@@ -3522,6 +4254,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard apps/web                  Scan a specific project\n"
             "  envguard doctor                    Show secret readiness matrix\n"
             "  envguard ownership                 Show provider ownership map\n"
+            "  envguard plan                      Print dry remediation proposals\n"
             "  envguard ci                        GitHub Actions annotations\n"
             "  envguard ci-template               Print a GitHub Actions workflow\n"
             "  envguard supabase xyz              Compare with Supabase secrets\n"
@@ -3532,6 +4265,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  envguard --baseline .envguard-baseline.json\n"
             "                                    Suppress known findings\n"
             "  envguard --details                 Show detailed issue tables\n"
+            "  envguard doctor --plan             Plan fixes from doctor findings\n"
             "  envguard --no-wizard               Scan current directory immediately\n"
             "  envguard --fix                     Interactive fix mode\n"
         ),
@@ -3541,7 +4275,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="*",
         help=(
             "Optional project path or preset: wizard, ci, ci-template, "
-            "doctor, matrix, ownership, owners, supabase <project-ref>, init, update"
+            "doctor, matrix, ownership, owners, plan, supabase <project-ref>, init, update"
         ),
     )
     parser.add_argument(
@@ -3564,6 +4298,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--github-annotations",
         action="store_true",
         help="Output GitHub Actions annotations for CI logs",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Print dry, copy-pasteable remediation proposals for doctor findings",
     )
     parser.add_argument(
         "--fix",
@@ -3649,6 +4388,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Ignore a missing key entirely. Can be repeated.",
     )
     parser.add_argument(
+        "--builtin-profile",
+        action="append",
+        default=None,
+        choices=sorted(RUNTIME_BUILTIN_PROFILES),
+        metavar="NAME",
+        help=(
+            "Runtime built-in profile to classify as external advisory "
+            "(default: github-actions, shell, ci). Can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--no-builtin-profiles",
+        action="store_true",
+        help="Disable built-in runtime variable profiles.",
+    )
+    parser.add_argument(
         "--allow-unused",
         action="store_true",
         help="Do not fail when unused .env.example keys or Supabase orphan secrets are found",
@@ -3669,7 +4424,13 @@ def _build_parser() -> argparse.ArgumentParser:
 def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments and friendly command presets."""
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    parse_argv = list(sys.argv[1:] if argv is None else argv)
+    plan_requested = "--plan" in parse_argv
+    if plan_requested:
+        parse_argv = [arg for arg in parse_argv if arg != "--plan"]
+    args = parser.parse_args(parse_argv)
+    if plan_requested:
+        args.plan = True
     tokens = list(args.tokens)
     args.command = None
 
@@ -3691,6 +4452,12 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             args.command = "ownership"
             if len(tokens) > 2:
                 parser.error(f"{first} accepts at most one project path")
+            if len(tokens) == 2:
+                args.path = tokens[1]
+        elif first == "plan":
+            args.command = "plan"
+            if len(tokens) > 2:
+                parser.error("plan accepts at most one project path")
             if len(tokens) == 2:
                 args.path = tokens[1]
         elif first == "ci-template":
@@ -3726,6 +4493,18 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                 parser.error("expected one project path")
             args.path = first
 
+    plan_mode = args.plan or args.command == "plan"
+    if plan_mode and (args.fix or args.fix_dry_run or args.write_baseline):
+        parser.error("plan cannot be combined with fix modes or --write-baseline")
+
+    if args.plan:
+        if args.command not in {None, "doctor", "plan"}:
+            parser.error(f"--plan is not supported with the {args.command} command")
+        if args.github_annotations:
+            parser.error("--plan is not supported with the ci command")
+        if args.command is None:
+            args.command = "plan"
+
     del args.tokens
     return args
 
@@ -3756,6 +4535,7 @@ def main(argv: Optional[List[str]] = None):
     if not scan_path.exists():
         print(f"Error: path does not exist: {scan_path}", file=sys.stderr)
         sys.exit(1)
+    reference_root = _repo_root_for_path(scan_path)
 
     if args.command == "init":
         config_path = write_project_config(
@@ -3772,6 +4552,11 @@ def main(argv: Optional[List[str]] = None):
         return
 
     config = load_project_config(scan_path)
+    builtin_profiles = [] if args.no_builtin_profiles else (
+        normalize_builtin_profiles(args.builtin_profile)
+        if args.builtin_profile is not None
+        else config.builtin_profiles
+    )
 
     # Determine dotenv path
     if args.dotenv:
@@ -3834,7 +4619,7 @@ def main(argv: Optional[List[str]] = None):
                     f"{supabase_project}"
                 )
             supabase_keys = fetch_supabase_secrets_with_cli(supabase_project, scan_path)
-        elif explicit_supabase_project and args.command not in {"doctor", "ownership"}:
+        elif explicit_supabase_project and args.command not in {"doctor", "plan", "ownership"}:
             print(
                 "Error: SUPABASE_ACCESS_TOKEN environment variable or an authenticated "
                 "Supabase CLI is required when using --supabase-project. You can also "
@@ -3861,7 +4646,7 @@ def main(argv: Optional[List[str]] = None):
             print(f"[debug] Supabase secrets ({len(supabase_keys)}): {supabase_keys}")
             print()
 
-    if args.command == "doctor":
+    if args.command in {"doctor", "plan"}:
         matrix = build_secrets_matrix(
             ref_map,
             dotenv_keys,
@@ -3870,10 +4655,14 @@ def main(argv: Optional[List[str]] = None):
             optional_keys=config.optional + args.optional,
             external_keys=config.external + args.external,
             ignore_keys=config.ignore_missing + args.ignore_missing,
+            builtin_profiles=builtin_profiles,
             dotenv_path=dotenv_path if dotenv_path.exists() else None,
             supabase_project=supabase_project,
             notes=doctor_notes,
         )
+        if args.command == "plan" or args.plan:
+            _plan_output(build_remediation_plan(matrix, scan_path), json_output=args.json)
+            return
         _matrix_output(matrix, json_output=args.json)
         if secrets_matrix_has_required_missing(matrix) and not args.allow_missing:
             sys.exit(1)
@@ -3904,6 +4693,7 @@ def main(argv: Optional[List[str]] = None):
         optional_keys=config.optional + args.optional,
         external_keys=config.external + args.external,
         ignore_keys=config.ignore_missing + args.ignore_missing,
+        builtin_profiles=builtin_profiles,
     )
 
     if args.write_baseline:
@@ -3924,7 +4714,7 @@ def main(argv: Optional[List[str]] = None):
 
     # ── Output ─────────────────────────────────────────────────────────────
     if args.github_annotations:
-        _github_annotations_output(result)
+        _github_annotations_output(result, reference_root=reference_root)
     elif args.json:
         _json_output(
             result,
@@ -3932,6 +4722,7 @@ def main(argv: Optional[List[str]] = None):
             allow_missing=args.allow_missing,
             baseline_path=baseline_path,
             baseline_suppressed=baseline_suppressed,
+            reference_root=reference_root,
         )
     elif args.summary:
         _summary_output(
@@ -3949,6 +4740,7 @@ def main(argv: Optional[List[str]] = None):
                 allow_missing=args.allow_missing,
                 baseline_path=baseline_path,
                 baseline_suppressed=baseline_suppressed,
+                reference_root=reference_root,
             )
         else:
             _rich_output(
