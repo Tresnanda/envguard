@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -163,6 +164,93 @@ def test_detect_references_finds_modern_js_framework_env_patterns(
         ("SERVER_SECRET", 'import.meta.env["KEY"]'),
         ("RUNTIME_SECRET", "$env/dynamic.KEY"),
     }
+
+
+def test_detect_references_finds_js_runtime_env_expansions(tmp_path: Path) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "\n".join(
+            [
+                "const {",
+                "  DATABASE_URL,",
+                "  API_KEY: apiKey,",
+                "} = process.env;",
+                "const bunPublic = Bun.env.PUBLIC_URL;",
+                "const bunSecret = Bun.env['BUN_SECRET'];",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("DATABASE_URL", 2, "process.env destructuring"),
+        ("API_KEY", 3, "process.env destructuring"),
+        ("PUBLIC_URL", 5, "Bun.env.KEY"),
+        ("BUN_SECRET", 6, 'Bun.env["KEY"]'),
+    }
+
+
+def test_detect_references_finds_process_env_destructuring_after_unrelated_braces(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "function f() { return { x: 1 }; }\nconst { DATABASE_URL } = process.env;",
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.line, ref.pattern_type) for ref in refs} == {
+        ("DATABASE_URL", 2, "process.env destructuring"),
+    }
+
+
+def test_detect_references_classifies_process_env_destructuring_defaults_optional(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "runtime.ts"
+    source.write_text(
+        "\n".join(
+            [
+                'const { DATABASE_URL = "sqlite" } = process.env;',
+                'const { API_KEY: apiKey = "test-key" } = process.env;',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = envguard.detect_references(source)
+
+    assert {(ref.key, ref.requirement, ref.reason) for ref in refs} == {
+        ("DATABASE_URL", "optional", "inline default or guard"),
+        ("API_KEY", "optional", "inline default or guard"),
+    }
+
+
+def test_detect_references_classifies_bun_env_inside_raw_template_as_external(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "launcher.ts"
+    source.write_text(
+        "\n".join(
+            [
+                "const local = Bun.env.LOCAL_SECRET;",
+                "const script = `",
+                "console.log(Bun.env.REMOTE_SECRET, Bun.env['REMOTE_TOKEN']);",
+                "`;",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refs = {ref.key: ref for ref in envguard.detect_references(source)}
+
+    assert refs["LOCAL_SECRET"].requirement == "required"
+    assert refs["REMOTE_SECRET"].requirement == "external"
+    assert refs["REMOTE_TOKEN"].requirement == "external"
 
 
 def test_detect_references_finds_zod_process_env_schema_keys(tmp_path: Path) -> None:
@@ -370,10 +458,19 @@ def test_scan_directory_skips_generated_mobile_and_bundle_noise(tmp_path: Path) 
         tmp_path / "ios" / "Pods" / "Headers" / "Generated.hpp",
         tmp_path / "assets" / "codemirror" / "cm.bundle.js.txt",
         tmp_path / "docs" / "plan.md",
+        tmp_path / "generated" / "runtime.ts",
+        tmp_path / "__generated__" / "bun.ts",
     ]
     for generated in generated_files:
         generated.parent.mkdir(parents=True, exist_ok=True)
-        generated.write_text("`${fake}` $noise %MORE_NOISE%\n", encoding="utf-8")
+        generated.write_text(
+            (
+                "`${fake}` $noise %MORE_NOISE%\n"
+                "const { GENERATED_SECRET } = process.env;\n"
+                "const bun = Bun.env.GENERATED_BUN_SECRET;\n"
+            ),
+            encoding="utf-8",
+        )
 
     refs = envguard.scan_directory(tmp_path)
 
@@ -653,6 +750,79 @@ def test_analyze_treats_supabase_secrets_as_available_configuration() -> None:
     assert result.supabase_orphans == ["LEGACY_SECRET"]
 
 
+def test_analyze_reports_advisory_key_typos_across_sources() -> None:
+    ref_map = {
+        "SUPABSE_URL": [
+            envguard.EnvReference(
+                key="SUPABSE_URL",
+                file="app.py",
+                line=7,
+                pattern_type="os.getenv",
+            )
+        ],
+        "EDGE_RUNER_SECRET": [
+            envguard.EnvReference(
+                key="EDGE_RUNER_SECRET",
+                file="supabase/functions/hello/index.ts",
+                line=2,
+                pattern_type="Deno.env.get",
+            )
+        ],
+    }
+
+    result = envguard.analyze(
+        ref_map=ref_map,
+        dotenv_keys=["SUPABASE_URL", "DATABASE_URL"],
+        supabase_keys=["EDGE_RUNNER_SECRET"],
+    )
+
+    assert result.key_typos == [
+        envguard.EnvKeyTypoSuggestion(
+            key="EDGE_RUNER_SECRET",
+            key_sources=["referenced"],
+            similar_key="EDGE_RUNNER_SECRET",
+            similar_key_sources=["supabase"],
+            distance=1,
+        ),
+        envguard.EnvKeyTypoSuggestion(
+            key="SUPABASE_URL",
+            key_sources=["dotenv"],
+            similar_key="SUPABSE_URL",
+            similar_key_sources=["referenced"],
+            distance=1,
+        ),
+    ]
+    assert envguard.has_blocking_issues(result, allow_unused=True, allow_missing=True) is False
+
+
+def test_json_output_includes_secret_safe_key_typo_advisories(capsys) -> None:
+    result = envguard.ScanResult(
+        key_typos=[
+            envguard.EnvKeyTypoSuggestion(
+                key="SUPABASE_URL",
+                key_sources=["dotenv"],
+                similar_key="SUPABSE_URL",
+                similar_key_sources=["referenced"],
+                distance=1,
+            )
+        ]
+    )
+
+    envguard._json_output(result)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["key_typos"] == [
+        {
+            "key": "SUPABASE_URL",
+            "sources": ["dotenv"],
+            "similar_key": "SUPABSE_URL",
+            "similar_sources": ["referenced"],
+            "distance": 1,
+        }
+    ]
+    assert payload["summary"]["blocking"] is False
+
+
 def test_detect_references_classifies_optional_defaults_and_embedded_runtime_context(
     tmp_path: Path,
 ) -> None:
@@ -752,6 +922,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
                 'optional = ["CLI_DEFAULT_BOT"]',
                 'external = ["REMOTE_CONTAINER_SECRET"]',
                 'ignore_missing = ["LEGACY_FLAG"]',
+                'builtin_profiles = ["github-actions"]',
             ]
         ),
         encoding="utf-8",
@@ -767,6 +938,7 @@ def test_load_project_config_reads_pyproject_tool_envguard(tmp_path: Path) -> No
     assert config.optional == ["CLI_DEFAULT_BOT"]
     assert config.external == ["REMOTE_CONTAINER_SECRET"]
     assert config.ignore_missing == ["LEGACY_FLAG"]
+    assert config.builtin_profiles == ["github-actions"]
 
 
 def test_scan_supabase_false_excludes_local_functions_and_remote_fetch(
@@ -853,6 +1025,66 @@ def test_analyze_honors_project_level_requirement_overrides() -> None:
     assert result.optional_missing == ["CLI_DEFAULT_BOT"]
     assert result.external_missing == ["REMOTE_CONTAINER_SECRET"]
     assert result.ignored_missing == ["LEGACY_FLAG"]
+
+
+def test_analyze_treats_runtime_builtins_as_external_advisory() -> None:
+    ref_map = {
+        "GITHUB_ENV": [
+            envguard.EnvReference(
+                key="GITHUB_ENV",
+                file=".github/workflows/ci.yml",
+                line=10,
+                pattern_type="$VAR",
+            )
+        ],
+        "RUNNER_TEMP": [
+            envguard.EnvReference(
+                key="RUNNER_TEMP",
+                file=".github/workflows/ci.yml",
+                line=11,
+                pattern_type="$VAR",
+            )
+        ],
+        "PATH": [
+            envguard.EnvReference(
+                key="PATH",
+                file="scripts/setup.sh",
+                line=3,
+                pattern_type="$VAR",
+            )
+        ],
+        "GITHUB_TOKEN": [
+            envguard.EnvReference(
+                key="GITHUB_TOKEN",
+                file=".github/workflows/ci.yml",
+                line=12,
+                pattern_type="$VAR",
+            )
+        ],
+    }
+
+    result = envguard.analyze(ref_map=ref_map, dotenv_keys=[])
+
+    assert result.missing == ["GITHUB_TOKEN"]
+    assert result.external_missing == ["GITHUB_ENV", "PATH", "RUNNER_TEMP"]
+
+
+def test_builtin_profiles_can_be_disabled() -> None:
+    ref_map = {
+        "GITHUB_OUTPUT": [
+            envguard.EnvReference(
+                key="GITHUB_OUTPUT",
+                file=".github/workflows/ci.yml",
+                line=7,
+                pattern_type="$VAR",
+            )
+        ]
+    }
+
+    result = envguard.analyze(ref_map=ref_map, dotenv_keys=[], builtin_profiles=[])
+
+    assert result.missing == ["GITHUB_OUTPUT"]
+    assert result.external_missing == []
 
 
 def test_github_annotations_include_file_line_and_messages() -> None:
@@ -1249,6 +1481,94 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_json_output_normalizes_reference_paths_inside_root_and_preserves_outside(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    inside = tmp_path / "src" / "app.py"
+    outside = tmp_path.parent / "outside.py"
+    result = envguard.ScanResult(
+        references={
+            "INSIDE_KEY": [
+                envguard.EnvReference(
+                    key="INSIDE_KEY",
+                    file=str(inside),
+                    line=2,
+                    pattern_type="os.getenv",
+                )
+            ],
+            "OUTSIDE_KEY": [
+                envguard.EnvReference(
+                    key="OUTSIDE_KEY",
+                    file=str(outside),
+                    line=1,
+                    pattern_type="os.getenv",
+                )
+            ],
+        },
+        missing=["INSIDE_KEY", "OUTSIDE_KEY"],
+    )
+
+    envguard._json_output(result, reference_root=tmp_path)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["references"]["INSIDE_KEY"][0]["file"] == "src/app.py"
+    assert payload["references"]["OUTSIDE_KEY"][0]["file"] == outside.as_posix()
+
+
+def test_json_output_reports_repo_relative_paths_for_root_and_subdirectory_scans(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "import os\nroot_secret = os.getenv('ROOT_SECRET')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as root_exit:
+        envguard.main(["--json", str(tmp_path)])
+    assert root_exit.value.code == 1
+    root_payload = json.loads(capsys.readouterr().out)
+    assert root_payload["references"]["ROOT_SECRET"][0]["file"] == "src/app.py"
+
+    app_dir = tmp_path / "apps" / "web"
+    app_dir.mkdir(parents=True)
+    (app_dir / "settings.py").write_text(
+        "import os\nweb_secret = os.getenv('WEB_SECRET')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as subdir_exit:
+        envguard.main(["--json", str(app_dir)])
+    assert subdir_exit.value.code == 1
+    subdir_payload = json.loads(capsys.readouterr().out)
+    assert subdir_payload["references"]["WEB_SECRET"][0]["file"] == "apps/web/settings.py"
+
+
+def test_github_annotations_use_repo_relative_paths_and_source_lines_for_subdir_scan(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    service_dir = tmp_path / "services" / "api"
+    service_dir.mkdir(parents=True)
+    (service_dir / "app.py").write_text(
+        "import os\n\nci_secret = os.environ['CI_SECRET']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.main(["ci", str(service_dir)])
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "::error file=services/api/app.py,line=3::Missing environment variable CI_SECRET"
+    ]
+
+
 def test_json_output_includes_baseline_suppression_metadata(
     capsys,
     tmp_path: Path,
@@ -1276,11 +1596,42 @@ def test_json_output_includes_baseline_suppression_metadata(
     }
 
 
+def test_json_output_includes_stable_schema_metadata_and_legacy_fields(capsys) -> None:
+    result = envguard.ScanResult(unused=["OLD_KEY"])
+
+    envguard._json_output(result)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema_version"] == 1
+    assert output["tool_version"] == envguard.tool_version()
+    assert output["scan"] == {"kind": "envguard.scan", "mode": "env-audit"}
+    assert output["summary"]["counts"]["unused"] == 1
+    assert output["unused"] == ["OLD_KEY"]
+    assert output["missing"] == []
+    assert output["references"] == {}
+
+
 def test_summary_output_includes_baselined_findings() -> None:
     assert envguard.format_summary_line(
         envguard.ScanResult(),
         baseline_suppressed={"missing": 1, "unused": 1},
     ) == "envguard: green — 2 baselined (exit 0)"
+
+
+def test_summary_output_marks_key_typos_as_nonblocking_advisory() -> None:
+    result = envguard.ScanResult(
+        key_typos=[
+            envguard.EnvKeyTypoSuggestion(
+                key="SUPABASE_URL",
+                key_sources=["dotenv"],
+                similar_key="SUPABSE_URL",
+                similar_key_sources=["referenced"],
+                distance=1,
+            )
+        ]
+    )
+
+    assert envguard.format_summary_line(result) == "envguard: yellow — 1 typo (exit 0)"
 
 
 def test_summary_output_formats_single_line_with_expected_exit(capsys) -> None:
@@ -1422,6 +1773,28 @@ def test_build_secrets_matrix_reports_sources_and_requirements_without_values(
     assert "optional-secret" not in output
 
 
+def test_matrix_json_output_includes_stable_schema_metadata_and_legacy_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    matrix = envguard.build_secrets_matrix(
+        {"DATABASE_URL": [envguard.EnvReference("DATABASE_URL", "app.py", 1, "os.getenv")]},
+        dotenv_keys=["DATABASE_URL"],
+        env={},
+        dotenv_path=Path(".env.example"),
+    )
+
+    envguard._matrix_json_output(matrix)
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["schema_version"] == 1
+    assert output["tool_version"] == envguard.tool_version()
+    assert output["scan"] == {"kind": "envguard.scan", "mode": "secrets-matrix"}
+    assert output["summary"]["counts"]["ready"] == 1
+    assert output["sources"]["dotenv"] == ".env.example"
+    assert output["rows"][0]["key"] == "DATABASE_URL"
+    assert output["unused_dotenv"] == []
+
+
 def test_doctor_command_prints_json_matrix_without_dotenv_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1469,6 +1842,277 @@ def test_doctor_command_exits_nonzero_for_required_missing(tmp_path: Path) -> No
         envguard.main(["doctor", str(tmp_path)])
 
     assert exc.value.code == 1
+
+
+def test_parse_cli_args_accepts_plan_command_and_doctor_plan_flag() -> None:
+    plan = envguard.parse_cli_args(["plan", "apps/web"])
+    assert plan.command == "plan"
+    assert plan.path == "apps/web"
+    assert plan.plan is False
+
+    doctor_plan = envguard.parse_cli_args(["doctor", "--plan", "apps/api"])
+    assert doctor_plan.command == "doctor"
+    assert doctor_plan.plan is True
+    assert doctor_plan.path == "apps/api"
+
+
+def test_plan_command_prints_redacted_copy_pasteable_actions_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                'MISSING_SECRET = os.getenv("MISSING_SECRET")',
+                'OPTIONAL_SECRET = os.getenv("OPTIONAL_SECRET", "fallback")',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=DOTENV_VALUE_SHOULD_STAY_HIDDEN\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "supabase" / "functions").mkdir(parents=True)
+    before = {
+        path.relative_to(tmp_path).as_posix(): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    monkeypatch.setattr(envguard, "supabase_cli_available", lambda: True)
+    monkeypatch.setattr(
+        envguard,
+        "fetch_supabase_secrets_with_cli",
+        lambda project_ref, scan_path: ["ORPHAN_EDGE_SECRET"],
+    )
+    monkeypatch.setattr(
+        envguard.Confirm,
+        "ask",
+        lambda *_args, **_kwargs: pytest.fail("plan mode should not prompt"),
+    )
+
+    envguard.main(["--json", "--supabase-project", "project-ref", "plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    actions = {action["key"]: action for action in payload["actions"]}
+
+    assert payload["summary"] == {
+        "counts": {
+            "missing": 1,
+            "optional_missing": 1,
+            "external_missing": 0,
+            "ignored_missing": 0,
+            "supabase_orphans": 1,
+        },
+        "writes": False,
+        "exit_code": 0,
+    }
+    assert "MISSING_SECRET" in actions
+    assert {
+        proposal["kind"] for proposal in actions["MISSING_SECRET"]["proposals"]
+    } == {"add_dotenv_example", "set_supabase_secret", "mark_optional", "mark_external"}
+    assert any(
+        shlex.split(proposal["command"])
+        == ["printf", "%s\\n", "MISSING_SECRET=", ">>", ".env.example"]
+        for proposal in actions["MISSING_SECRET"]["proposals"]
+    )
+    assert any(
+        proposal["command"]
+        == "supabase secrets set MISSING_SECRET='replace-me' --project-ref project-ref"
+        for proposal in actions["MISSING_SECRET"]["proposals"]
+    )
+    assert actions["OPTIONAL_SECRET"]["finding"] == "optional_missing"
+    assert actions["ORPHAN_EDGE_SECRET"]["finding"] == "supabase_orphan"
+    assert any(
+        proposal["kind"] == "review_orphan"
+        for proposal in actions["ORPHAN_EDGE_SECRET"]["proposals"]
+    )
+    assert "DOTENV_VALUE_SHOULD_STAY_HIDDEN" not in output
+    assert not (tmp_path / ".env.example.bak").exists()
+    assert {
+        path.relative_to(tmp_path).as_posix(): path.read_text(encoding="utf-8")
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    } == before
+
+
+def test_plan_supabase_commands_quote_untrusted_key_names(tmp_path: Path) -> None:
+    malicious_key = "BAD_KEY; echo pwned"
+    malicious_orphan = "OLD_KEY; touch /tmp/pwned"
+    project_ref = "project-ref; rm -rf /"
+    matrix = envguard.SecretsMatrix(
+        rows=[
+            envguard.SecretsMatrixRow(
+                key=malicious_key,
+                requirement="required",
+                status="missing",
+                dotenv=False,
+                environment=False,
+                supabase=False,
+                references=1,
+            )
+        ],
+        supabase_project=project_ref,
+        supabase_checked=True,
+        supabase_orphans=[malicious_orphan],
+    )
+
+    plan = envguard.build_remediation_plan(matrix, tmp_path)
+    commands = [
+        proposal.command
+        for action in plan.actions
+        for proposal in action.proposals
+        if proposal.command and proposal.command.startswith("supabase secrets")
+    ]
+
+    assert shlex.split(commands[0]) == [
+        "supabase",
+        "secrets",
+        "set",
+        f"{malicious_key}=replace-me",
+        "--project-ref",
+        project_ref,
+    ]
+    assert shlex.split(commands[1]) == [
+        "supabase",
+        "secrets",
+        "unset",
+        malicious_orphan,
+        "--project-ref",
+        project_ref,
+    ]
+
+
+def test_plan_dotenv_append_command_quotes_untrusted_key_names(tmp_path: Path) -> None:
+    malicious_key = "BAD_KEY' ; touch /tmp/envguard-pwned; echo '"
+
+    command = envguard._dotenv_append_command(malicious_key, None, tmp_path)
+
+    assert shlex.split(command) == [
+        "printf",
+        "%s\\n",
+        f"{malicious_key}=",
+        ">>",
+        envguard._dotenv_plan_path(None, tmp_path),
+    ]
+
+
+def test_global_plan_path_enters_plan_mode_without_regular_scan_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+
+    envguard.main(["--plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert "envguard plan" in output
+    assert "MISSING_SECRET" in output
+    assert "No files were written" in output
+
+
+def test_global_plan_rejects_fix_and_write_baseline_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=placeholder\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / ".envguard-baseline.json"
+
+    with pytest.raises(SystemExit) as fix_exc:
+        envguard.main(["--plan", "--fix", str(tmp_path)])
+    with pytest.raises(SystemExit) as baseline_exc:
+        envguard.main(["--plan", "--write-baseline", str(baseline), str(tmp_path)])
+
+    assert fix_exc.value.code == 2
+    assert baseline_exc.value.code == 2
+    assert not baseline.exists()
+    assert not (tmp_path / ".env.example.bak").exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--fix", "plan"],
+        ["--fix-dry-run", "plan"],
+        ["--write-baseline", "{baseline}", "plan"],
+    ],
+)
+def test_plan_command_rejects_side_effecting_flags_before_output(
+    argv: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "DOCUMENTED_SECRET=placeholder\n",
+        encoding="utf-8",
+    )
+    baseline = tmp_path / ".envguard-baseline.json"
+    resolved_argv = [
+        str(baseline) if token == "{baseline}" else token for token in argv
+    ] + [str(tmp_path)]
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.main(resolved_argv)
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert captured.out == ""
+    assert "plan" in captured.err
+    assert not baseline.exists()
+    assert not (tmp_path / ".env.example.bak").exists()
+
+
+def test_plan_json_reports_supabase_checked_when_unchecked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SUPABASE_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(envguard, "supabase_cli_available", lambda: False)
+
+    envguard.main(["--json", "--supabase-project", "project-ref", "plan", str(tmp_path)])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sources"]["supabase_project"] == "project-ref"
+    assert payload["sources"]["supabase_checked"] is False
+
+
+def test_doctor_plan_flag_uses_plan_mode_without_failing_for_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "app.py").write_text(
+        'import os\nMISSING_SECRET = os.getenv("MISSING_SECRET")\n',
+        encoding="utf-8",
+    )
+
+    envguard.main(["doctor", "--plan", str(tmp_path)])
+
+    output = capsys.readouterr().out
+    assert "envguard plan" in output
+    assert "MISSING_SECRET" in output
+    assert "No files were written" in output
 
 
 def test_parse_cli_args_accepts_update_command() -> None:
@@ -1580,6 +2224,70 @@ def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:
             'dotenv = "config/example.env"',
             'exclude = ["fixtures/**"]',
             'supabase_project = "abcd1234"',
+            "",
+        ]
+    )
+
+
+def test_write_project_config_refuses_symlinked_pyproject(tmp_path: Path) -> None:
+    target = tmp_path / "outside-pyproject-target"
+    original = "[project]\nname = \"keep-me\"\n"
+    target.write_text(original, encoding="utf-8")
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.symlink_to(target)
+
+    with pytest.raises(OSError, match="Refusing to update symlinked pyproject.toml"):
+        envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert pyproject.is_symlink()
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_write_project_config_refuses_without_no_follow_support(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = \"keep-me\"\n"
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.delattr(envguard.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(OSError, match="without no-follow protection"):
+        envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert pyproject.read_text(encoding="utf-8") == original
+
+
+def test_write_project_config_atomic_write_replaces_swapped_symlink_not_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = \"demo\"\n", encoding="utf-8")
+    malicious_target = tmp_path / "outside-pyproject-target"
+    target_original = "[project]\nname = \"do-not-change\"\n"
+    malicious_target.write_text(target_original, encoding="utf-8")
+    real_read = envguard._read_text_no_follow
+
+    def read_then_swap(path: Path) -> tuple[str, int]:
+        result = real_read(path)
+        path.unlink()
+        path.symlink_to(malicious_target)
+        return result
+
+    monkeypatch.setattr(envguard, "_read_text_no_follow", read_then_swap)
+
+    envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert malicious_target.read_text(encoding="utf-8") == target_original
+    assert not pyproject.is_symlink()
+    assert pyproject.read_text(encoding="utf-8") == "\n".join(
+        [
+            "[project]",
+            'name = "demo"',
+            "",
+            "[tool.envguard]",
+            'dotenv = ".env.example"',
             "",
         ]
     )

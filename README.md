@@ -136,6 +136,15 @@ envguard matrix apps/web --json
 
 The doctor/matrix command is opt-in and reports one row per referenced key with its requirement class (`required`, `optional`, `external`, or `ignored`), whether the key name is present in the selected dotenv file, the current process environment, and fetched Supabase secrets, plus a readiness status. It never prints dotenv values, shell environment values, Supabase token values, or Supabase secret values. It exits non-zero when a required key is missing from all checked sources unless `--allow-missing` is used.
 
+Print a proposal-only remediation plan for missing or orphaned secret findings:
+
+```bash
+envguard plan
+envguard doctor --plan apps/web
+```
+
+Plan mode builds on the doctor matrix and emits redacted, copy-pasteable next steps such as adding empty placeholders to `.env.example`, setting a Supabase secret placeholder, marking a key optional/external, or reviewing an orphaned Supabase secret. It is dry by default: no prompts, backups, dotenv writes, or secret writes are performed, and real dotenv values or shell/Supabase secret values are never printed.
+
 Create a baseline for existing drift, then fail only on new findings:
 
 ```bash
@@ -331,7 +340,7 @@ Dynamic expressions such as `os.getenv(prefix + "_TOKEN")` are intentionally not
 
 ```text
 usage: envguard [-h] [--path PATH] [--json] [--summary]
-                [--github-annotations] [--fix] [--fix-dry-run]
+                [--github-annotations] [--plan] [--fix] [--fix-dry-run]
                 [--fix-real-env]
                 [--supabase-project SUPABASE_PROJECT]
                 [--dotenv DOTENV] [--baseline BASELINE]
@@ -339,13 +348,14 @@ usage: envguard [-h] [--path PATH] [--json] [--summary]
                 [--exclude PATTERN]
                 [--optional KEY] [--external KEY] [--ignore-missing KEY]
                 [--allow-unused] [--allow-missing] [--no-wizard]
-                [path|wizard|doctor|matrix|ci|ci-template|supabase|init|update] [...]
+                [path|wizard|doctor|matrix|plan|ci|ci-template|supabase|init|update] [...]
 
 options:
   path                  Optional project path, e.g. envguard apps/web.
   wizard                Build and optionally run an audit command interactively.
   doctor [path]         Show key readiness across dotenv/env/Supabase sources.
   matrix [path]         Alias for doctor.
+  plan [path]           Print dry remediation proposals from doctor findings.
   ci [path]             Shortcut for GitHub Actions annotations.
   ci-template [path]    Print a copy-pasteable GitHub Actions workflow.
   supabase ID [path]    Shortcut for Supabase secret comparison.
@@ -356,6 +366,7 @@ options:
   --json                Print a JSON report.
   --summary             Print one compact terminal summary line.
   --github-annotations  Print GitHub Actions annotations for CI logs.
+  --plan                Print dry, copy-pasteable remediation proposals for doctor findings.
   --fix                 Interactively remove unused keys from .env.example.
   --fix-dry-run         Preview unused dotenv entries that --fix would prune without writing files.
   --fix-real-env        Allow --fix to edit a real .env file instead of only templates.
