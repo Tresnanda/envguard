@@ -1223,6 +1223,94 @@ def test_json_output_includes_summary_metadata(capsys) -> None:
     assert relaxed_output["summary"]["exit_code"] == 0
 
 
+def test_json_output_normalizes_reference_paths_inside_root_and_preserves_outside(
+    capsys,
+    tmp_path: Path,
+) -> None:
+    inside = tmp_path / "src" / "app.py"
+    outside = tmp_path.parent / "outside.py"
+    result = envguard.ScanResult(
+        references={
+            "INSIDE_KEY": [
+                envguard.EnvReference(
+                    key="INSIDE_KEY",
+                    file=str(inside),
+                    line=2,
+                    pattern_type="os.getenv",
+                )
+            ],
+            "OUTSIDE_KEY": [
+                envguard.EnvReference(
+                    key="OUTSIDE_KEY",
+                    file=str(outside),
+                    line=1,
+                    pattern_type="os.getenv",
+                )
+            ],
+        },
+        missing=["INSIDE_KEY", "OUTSIDE_KEY"],
+    )
+
+    envguard._json_output(result, reference_root=tmp_path)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["references"]["INSIDE_KEY"][0]["file"] == "src/app.py"
+    assert payload["references"]["OUTSIDE_KEY"][0]["file"] == outside.as_posix()
+
+
+def test_json_output_reports_repo_relative_paths_for_root_and_subdirectory_scans(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".env.example").write_text("", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "import os\nroot_secret = os.getenv('ROOT_SECRET')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as root_exit:
+        envguard.main(["--json", str(tmp_path)])
+    assert root_exit.value.code == 1
+    root_payload = json.loads(capsys.readouterr().out)
+    assert root_payload["references"]["ROOT_SECRET"][0]["file"] == "src/app.py"
+
+    app_dir = tmp_path / "apps" / "web"
+    app_dir.mkdir(parents=True)
+    (app_dir / "settings.py").write_text(
+        "import os\nweb_secret = os.getenv('WEB_SECRET')\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as subdir_exit:
+        envguard.main(["--json", str(app_dir)])
+    assert subdir_exit.value.code == 1
+    subdir_payload = json.loads(capsys.readouterr().out)
+    assert subdir_payload["references"]["WEB_SECRET"][0]["file"] == "apps/web/settings.py"
+
+
+def test_github_annotations_use_repo_relative_paths_and_source_lines_for_subdir_scan(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    service_dir = tmp_path / "services" / "api"
+    service_dir.mkdir(parents=True)
+    (service_dir / "app.py").write_text(
+        "import os\n\nci_secret = os.environ['CI_SECRET']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        envguard.main(["ci", str(service_dir)])
+
+    assert exc.value.code == 1
+    assert capsys.readouterr().out.splitlines() == [
+        "::error file=services/api/app.py,line=3::Missing environment variable CI_SECRET"
+    ]
+
+
 def test_json_output_includes_baseline_suppression_metadata(
     capsys,
     tmp_path: Path,
