@@ -158,6 +158,17 @@ class EnvReference:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class EnvKeyTypoSuggestion:
+    """Advisory-only hint for two similarly named environment keys."""
+
+    key: str
+    key_sources: List[str]
+    similar_key: str
+    similar_key_sources: List[str]
+    distance: int
+
+
 @dataclass
 class ScanResult:
     """Results of scanning a codebase for env var references."""
@@ -182,6 +193,9 @@ class ScanResult:
 
     supabase_orphans: List[str] = field(default_factory=list)
     """Keys in Supabase secrets but not referenced in code nor .env.example."""
+
+    key_typos: List[EnvKeyTypoSuggestion] = field(default_factory=list)
+    """Advisory-only likely typo/sibling pairs among discovered key names."""
 
 
 @dataclass
@@ -2092,6 +2106,94 @@ def delete_supabase_secrets(project_ref: str, access_token: str, names: List[str
 # ─── Analysis ──────────────────────────────────────────────────────────────
 
 
+KEY_TYPO_SOURCE_ORDER = ("referenced", "dotenv", "supabase")
+KEY_TYPO_MIN_LENGTH = 6
+KEY_TYPO_MAX_DISTANCE = 1
+
+
+def _ordered_key_sources(sources: set[str]) -> List[str]:
+    return [source for source in KEY_TYPO_SOURCE_ORDER if source in sources]
+
+
+def _env_key_edit_distance(left: str, right: str, max_distance: int) -> int:
+    """Return a small Damerau-Levenshtein distance, capped above max_distance."""
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > max_distance:
+        return max_distance + 1
+
+    previous_previous: Optional[List[int]] = None
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i] + [0] * len(right)
+        row_min = current[0]
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current[j] = min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + cost,
+            )
+            if (
+                previous_previous is not None
+                and i > 1
+                and j > 1
+                and left_char == right[j - 2]
+                and left[i - 2] == right_char
+            ):
+                current[j] = min(current[j], previous_previous[j - 2] + 1)
+            row_min = min(row_min, current[j])
+        if row_min > max_distance:
+            return max_distance + 1
+        previous_previous, previous = previous, current
+    return previous[-1]
+
+
+def _looks_like_typo_candidate(key: str) -> bool:
+    """Keep typo hints focused on human-named env keys, not short flags like CI."""
+    return len(key) >= KEY_TYPO_MIN_LENGTH and "_" in key
+
+
+def detect_key_typo_suggestions(
+    referenced_keys: List[str],
+    dotenv_keys: List[str],
+    supabase_keys: Optional[List[str]] = None,
+) -> List[EnvKeyTypoSuggestion]:
+    """Find advisory-only likely env key typos without inspecting secret values."""
+    sources_by_key: dict[str, set[str]] = {}
+    for source, keys in (
+        ("referenced", referenced_keys),
+        ("dotenv", dotenv_keys),
+        ("supabase", supabase_keys or []),
+    ):
+        for key in keys:
+            if _looks_like_typo_candidate(key):
+                sources_by_key.setdefault(key, set()).add(source)
+
+    suggestions: List[EnvKeyTypoSuggestion] = []
+    keys = sorted(sources_by_key)
+    for index, key in enumerate(keys):
+        for similar_key in keys[index + 1 :]:
+            if sources_by_key[key] == sources_by_key[similar_key]:
+                continue
+            distance = _env_key_edit_distance(
+                key.upper(),
+                similar_key.upper(),
+                KEY_TYPO_MAX_DISTANCE,
+            )
+            if 0 < distance <= KEY_TYPO_MAX_DISTANCE:
+                suggestions.append(
+                    EnvKeyTypoSuggestion(
+                        key=key,
+                        key_sources=_ordered_key_sources(sources_by_key[key]),
+                        similar_key=similar_key,
+                        similar_key_sources=_ordered_key_sources(sources_by_key[similar_key]),
+                        distance=distance,
+                    )
+                )
+    return suggestions
+
+
 def analyze(
     ref_map: Dict[str, List[EnvReference]],
     dotenv_keys: List[str],
@@ -2145,6 +2247,12 @@ def analyze(
     if supabase_keys is not None:
         code_and_example = code_keys | example_keys
         result.supabase_orphans = sorted(supabase_set - code_and_example)
+
+    result.key_typos = detect_key_typo_suggestions(
+        sorted(code_keys),
+        dotenv_keys,
+        supabase_keys,
+    )
 
     return result
 
@@ -2764,6 +2872,9 @@ def _rich_output(
     baseline_suppressed: Optional[dict[str, int]] = None,
 ):
     """Pretty terminal output using rich."""
+    assert Console is not None
+    assert Table is not None
+    assert Panel is not None
     console = Console()
     should_show_details_command = False
 
@@ -2891,6 +3002,34 @@ def _rich_output(
             should_show_details_command = should_show_details_command or bool(details_command)
         console.print()
 
+    # Env key typo/sibling advisories (non-blocking)
+    if result.key_typos:
+        if show_details:
+            table = Table(
+                title="[blue]ADVISORY[/] — Similar environment key names",
+                border_style="blue",
+            )
+            table.add_column("Key", style="blue", no_wrap=True)
+            table.add_column("Sources", style="dim")
+            table.add_column("Similar key", style="blue", no_wrap=True)
+            table.add_column("Similar sources", style="dim")
+            for suggestion in result.key_typos:
+                table.add_row(
+                    suggestion.key,
+                    ", ".join(suggestion.key_sources),
+                    suggestion.similar_key,
+                    ", ".join(suggestion.similar_key_sources),
+                )
+            console.print(table)
+        else:
+            label = "pair" if len(result.key_typos) == 1 else "pairs"
+            console.print(
+                f"[blue]i[/] {len(result.key_typos)} similar env key {label} found "
+                "(possible typo)."
+            )
+            should_show_details_command = should_show_details_command or bool(details_command)
+        console.print()
+
     # Supabase orphans
     if result.supabase_orphans:
         if show_details:
@@ -2917,7 +3056,7 @@ def _rich_output(
 
     # Overall status
     blocking_issues = bool(result.unused or result.missing or result.supabase_orphans)
-    advisory_issues = bool(result.optional_missing or result.external_missing)
+    advisory_issues = bool(result.optional_missing or result.external_missing or result.key_typos)
     if blocking_issues:
         if show_details:
             console.print("[bold red]✗[/] Issues found. Review the tables above.")
@@ -2992,6 +3131,16 @@ def _json_output(
         "external_missing": result.external_missing,
         "ignored_missing": result.ignored_missing,
         "supabase_orphans": result.supabase_orphans,
+        "key_typos": [
+            {
+                "key": suggestion.key,
+                "sources": suggestion.key_sources,
+                "similar_key": suggestion.similar_key,
+                "similar_sources": suggestion.similar_key_sources,
+                "distance": suggestion.distance,
+            }
+            for suggestion in result.key_typos
+        ],
         "references": {
             key: [
                 {
@@ -3033,6 +3182,7 @@ def format_summary_line(
         (len(result.optional_missing), "optional"),
         (len(result.external_missing), "external"),
         (len(result.ignored_missing), "ignored"),
+        (len(result.key_typos), "typo"),
         (len(result.supabase_orphans), "orphaned"),
     ]
     actual_counts_present = any(count for count, _label in counts)
