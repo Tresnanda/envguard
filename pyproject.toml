@@ -57,4 +57,5 @@ select = ["E", "F", "W", "I"]
 [tool.pytest.ini_options]
 minversion = "7.0"
 addopts = "-v --tb=short"
+pythonpath = ["."]
 testpaths = ["tests"]

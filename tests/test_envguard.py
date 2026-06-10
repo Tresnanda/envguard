@@ -2017,6 +2017,70 @@ def test_write_project_config_creates_envguard_defaults(tmp_path: Path) -> None:
     )
 
 
+def test_write_project_config_refuses_symlinked_pyproject(tmp_path: Path) -> None:
+    target = tmp_path / "outside-pyproject-target"
+    original = "[project]\nname = \"keep-me\"\n"
+    target.write_text(original, encoding="utf-8")
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.symlink_to(target)
+
+    with pytest.raises(OSError, match="Refusing to update symlinked pyproject.toml"):
+        envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert pyproject.is_symlink()
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_write_project_config_refuses_without_no_follow_support(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    original = "[project]\nname = \"keep-me\"\n"
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.delattr(envguard.os, "O_NOFOLLOW", raising=False)
+
+    with pytest.raises(OSError, match="without no-follow protection"):
+        envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert pyproject.read_text(encoding="utf-8") == original
+
+
+def test_write_project_config_atomic_write_replaces_swapped_symlink_not_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = \"demo\"\n", encoding="utf-8")
+    malicious_target = tmp_path / "outside-pyproject-target"
+    target_original = "[project]\nname = \"do-not-change\"\n"
+    malicious_target.write_text(target_original, encoding="utf-8")
+    real_read = envguard._read_text_no_follow
+
+    def read_then_swap(path: Path) -> tuple[str, int]:
+        result = real_read(path)
+        path.unlink()
+        path.symlink_to(malicious_target)
+        return result
+
+    monkeypatch.setattr(envguard, "_read_text_no_follow", read_then_swap)
+
+    envguard.write_project_config(tmp_path, dotenv=".env.example")
+
+    assert malicious_target.read_text(encoding="utf-8") == target_original
+    assert not pyproject.is_symlink()
+    assert pyproject.read_text(encoding="utf-8") == "\n".join(
+        [
+            "[project]",
+            'name = "demo"',
+            "",
+            "[tool.envguard]",
+            'dotenv = ".env.example"',
+            "",
+        ]
+    )
+
+
 def test_discover_dotenv_path_prefers_templates_before_dotenv(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("SECRET=value\n", encoding="utf-8")
     (tmp_path / ".env.sample").write_text("SECRET=\n", encoding="utf-8")

@@ -1273,17 +1273,27 @@ def write_project_config(
     pyproject_path = project_path / "pyproject.toml"
     new_block = _format_project_config(dotenv, exclude, supabase_project)
 
-    if not pyproject_path.exists():
-        pyproject_path.write_text(new_block, encoding="utf-8")
-        return pyproject_path
+    if pyproject_path.is_symlink():
+        raise OSError(f"Refusing to update symlinked pyproject.toml: {pyproject_path}")
 
-    existing = pyproject_path.read_text(encoding="utf-8")
+    try:
+        existing, file_mode = _read_text_no_follow(pyproject_path)
+    except FileNotFoundError:
+        _atomic_write_no_follow(pyproject_path, new_block, 0o644)
+        return pyproject_path
+    except OSError as exc:
+        if "O_NOFOLLOW is unavailable" in str(exc):
+            raise OSError(
+                f"Refusing to update pyproject.toml without no-follow protection: {pyproject_path}"
+            ) from exc
+        raise OSError(f"Refusing to update non-regular pyproject.toml: {pyproject_path}") from exc
+
     pattern = re.compile(r"(?ms)^\[tool\.envguard\]\n.*?(?=^\[|\Z)")
     if pattern.search(existing):
         updated = pattern.sub(new_block, existing).rstrip() + "\n"
     else:
         updated = existing.rstrip() + "\n\n" + new_block
-    pyproject_path.write_text(updated, encoding="utf-8")
+    _atomic_write_no_follow(pyproject_path, updated, file_mode)
     return pyproject_path
 
 
@@ -3203,8 +3213,15 @@ def _write_backup_exclusive(path: Path, content: str) -> Path:
 
 
 def _no_follow_flags(flags: int) -> int:
-    """Add O_NOFOLLOW when the platform exposes it."""
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    """Add O_NOFOLLOW, failing closed when unavailable.
+
+    The callers use this for user-controlled config/dotenv write paths. Falling
+    back to plain open() would silently follow a swapped final-component symlink,
+    so platforms without O_NOFOLLOW must refuse the hardened operation instead.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("Refusing no-follow file operation: O_NOFOLLOW is unavailable")
     return flags | no_follow
 
 
@@ -3214,7 +3231,7 @@ def _read_text_no_follow(path: Path) -> tuple[str, int]:
     try:
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError(f"Refusing to read non-regular dotenv file: {path}")
+            raise OSError(f"Refusing to read non-regular file: {path}")
         mode = stat.S_IMODE(file_stat.st_mode)
         with os.fdopen(fd, "r", encoding="utf-8") as file_obj:
             fd = -1
